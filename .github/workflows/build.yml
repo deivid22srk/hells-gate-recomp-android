@@ -23,6 +23,10 @@ jobs:
         run: ./scripts/setup-android.sh
 
       - name: Build rexglue CLI (host)
+        env:
+          # The SDK hard-requires Clang (GCC fails the compiler check).
+          CC: clang
+          CXX: clang++
         run: |
           cmake -S thirdparty/rexglue-sdk -B out/host -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -53,6 +57,11 @@ jobs:
 
       - name: Set up ReXGlue SDK (clone + patches + submodules)
         run: ./scripts/setup-android.sh
+
+      - name: Install CMake 3.31.1 (exact version required by AGP)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" >/dev/null
 
       - name: Generate stub codegen (framework build, no game code)
         run: python3 scripts/stub_codegen.py
