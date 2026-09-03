@@ -79,6 +79,11 @@ target_include_directories(main PRIVATE
     "${REXSDK_DIR}/src/ui"
 )
 target_compile_options(main PRIVATE -Wno-unused-variable)
+# Same spelling/scope as the SDK root CMakeLists (add_compile_definitions is
+# directory-scoped and does NOT reach targets created by this CMakeLists).
+# rex_app.cpp expands REXGLUE_BUILD_TITLE -> REXGLUE_BUILD_CONFIG; without
+# this the macro expands to a bare identifier and fails to parse.
+target_compile_definitions(main PRIVATE REXGLUE_BUILD_CONFIG="$<CONFIG>")
 # rexui is linked here on purpose: it carries the imgui include dirs
 # (imgui itself is PRIVATE inside rex::runtime, so it does not propagate)
 # needed by <rex/ui/style.h> pulled in through rex_app.h.

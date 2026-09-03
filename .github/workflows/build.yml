@@ -19,7 +19,15 @@ jobs:
           sudo apt-get update
           # libx11-xcb-dev / libwayland-dev: REQUIRED pkg-config deps of rexui
           # (vulkan/api.h pulls <wayland-client.h>) even in headless CLI builds.
-          sudo apt-get install -y clang ninja-build libx11-xcb-dev libwayland-dev libwayland-client0
+          sudo apt-get install -y ninja-build libx11-xcb-dev libwayland-dev libwayland-client0
+          # Clang 19: matches the locally validated toolchain. The runner's
+          # default apt clang (18) + libstdc++ 13 fails the SDK's C++23
+          # std::expected usage in map_parser.h even though <expected> is
+          # included directly.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | sudo tee /etc/apt/sources.list.d/llvm19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19
 
       - name: Set up ReXGlue SDK (clone + patches)
         run: ./scripts/setup-android.sh
@@ -27,8 +35,8 @@ jobs:
       - name: Build rexglue CLI (host)
         env:
           # The SDK hard-requires Clang (GCC fails the compiler check).
-          CC: clang
-          CXX: clang++
+          CC: clang-19
+          CXX: clang++-19
         run: |
           cmake -S thirdparty/rexglue-sdk -B out/host -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
