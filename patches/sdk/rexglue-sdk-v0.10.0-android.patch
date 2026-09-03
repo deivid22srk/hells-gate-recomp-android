@@ -1,8 +1,30 @@
-diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9b3cdf5..4e48677 100644
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -158,6 +158,17 @@ if(WIN32)
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-09-03 19:05:18.000000000 +0000
++++ b/CMakeLists.txt	2026-09-03 20:06:56.333487880 +0000
+@@ -23,6 +23,8 @@
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
++option(REXGLUE_ENABLE_DESKTOP_SDL_BACKENDS
++       "Build SDL3 desktop video/audio backends (X11/Wayland/ALSA/Pulse). Turn OFF for headless CLI-only builds." ON)
+ # Propagate profiling defines globally (compiled out in Release)
+ if(REXGLUE_ENABLE_TRACY)
+     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
+@@ -139,6 +141,13 @@
+     -fno-char8_t
+ )
+ 
++# src/core/memory.cpp uses SSSE3 shuffle intrinsics directly (x86 byte-swap
++# fast paths). Consumers normally add these flags themselves; add them here so
++# a standalone SDK build (rexglue CLI) compiles out of the box.
++if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
++    add_compile_options(-mssse3 -msse4.1)
++endif()
++
+ # Platform detection (supports AMD64 and ARM64)
+ set(REX_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
+ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+@@ -158,6 +167,17 @@
          message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
      endif()
      add_compile_definitions(REX_PLATFORM_WINDOWS=1)
@@ -20,7 +42,7 @@ index 9b3cdf5..4e48677 100644
  elseif(UNIX AND NOT APPLE)
      if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
          set(REX_PLATFORM "linux-amd64")
-@@ -177,7 +188,7 @@ elseif(APPLE)
+@@ -177,7 +197,7 @@
      endif()
      add_compile_definitions(REX_PLATFORM_MAC=1)
  else()
@@ -29,11 +51,101 @@ index 9b3cdf5..4e48677 100644
  endif()
  
  # Build config as compile definition (multi-config generators don't know config at configure time)
-diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
-index d1f7cdd..5169b1f 100644
---- a/resources/templates/codegen/pch_h.inja
-+++ b/resources/templates/codegen/pch_h.inja
-@@ -132,9 +132,25 @@ extern PPCFuncMapping PPCFuncMappings[];
+diff -ruN a/include/rex/main_android.h b/include/rex/main_android.h
+--- a/include/rex/main_android.h	1970-01-01 00:00:00.000000000 +0000
++++ b/include/rex/main_android.h	2026-09-03 19:09:15.977166127 +0000
+@@ -0,0 +1,47 @@
++#pragma once
++/**
++ ******************************************************************************
++ * ReXGlue : Xbox 360 Recompilation SDK
++ ******************************************************************************
++ * Android runtime glue declarations. The definitions live in
++ * src/core/android_runtime.cpp (rexcore, guarded by REX_PLATFORM_ANDROID).
++ *
++ * The app's JNI glue (SDL activity side) calls SetAndroidApplicationContext()
++ * before any runtime subsystem starts.
++ ******************************************************************************
++ * @added      deivid22srk, 2026 - Android port support
++ */
++
++#include <cstdint>
++#include <filesystem>
++#include <string>
++
++#include <rex/platform.h>
++
++#if REX_PLATFORM_ANDROID
++
++namespace rex {
++
++// Device API level (ro.build.version.sdk), cached on first call. At least the
++// compile-time minimum (__ANDROID_API__) is returned.
++uint32_t GetAndroidApiLevel();
++
++// Provided by the app's JNI glue before runtime startup:
++//  - java_vm:         JavaVM* (used to attach native threads for JNI calls)
++//  - android_context: jobject of the foreground Activity (global ref taken)
++//  - native_library_dir: ApplicationInfo.nativeLibraryDir, where the packaged
++//    .so files live (used by GetExecutableFolder() and the GPU plugin loader)
++void SetAndroidApplicationContext(void* java_vm, void* android_context,
++                                  const char* native_library_dir);
++
++// nativeLibraryDir backing GetExecutableFolder() on Android.
++const std::filesystem::path& GetAndroidNativeLibraryDir();
++
++// JNI bridge invoked by rex::filesystem::OpenAndroidContentFileDescriptor.
++// Implemented on top of a static Java helper on the activity class that
++// returns a ParcelFileDescriptor for the given content URI.
++int OpenContentUriFdJavaBridge(const std::string_view uri, const char* mode);
++
++}  // namespace rex
++
++#endif  // REX_PLATFORM_ANDROID
+diff -ruN a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+--- a/include/rex/ui/surface_android.h	1970-01-01 00:00:00.000000000 +0000
++++ b/include/rex/ui/surface_android.h	2026-09-03 19:09:22.122189843 +0000
+@@ -0,0 +1,36 @@
++#pragma once
++/**
++ ******************************************************************************
++ * ReXGlue : Xbox 360 Recompilation SDK
++ ******************************************************************************
++ * Android ANativeWindow-backed presentation surface (Vulkan
++ * VK_KHR_android_surface). Created by WindowSDL::CreateSurfaceImpl from the
++ * SDL window's SDL_PROP_WINDOW_ANDROID_NATIVE_WINDOW_POINTER property.
++ ******************************************************************************
++ * @added      deivid22srk, 2026 - Android port support
++ */
++
++#include <cstdint>
++
++#include <android/native_window.h>
++
++#include <rex/ui/surface.h>
++
++namespace rex {
++namespace ui {
++
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff -ruN a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+--- a/resources/templates/codegen/pch_h.inja	2026-09-03 19:05:18.000000000 +0000
++++ b/resources/templates/codegen/pch_h.inja	2026-09-03 19:11:02.948576630 +0000
+@@ -132,9 +132,25 @@
  #if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
  #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
  #else
@@ -60,11 +172,10 @@ index d1f7cdd..5169b1f 100644
  #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
  
  #define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
-index b2d70f5..9de7496 100644
---- a/src/codegen/builders/system.cpp
-+++ b/src/codegen/builders/system.cpp
-@@ -31,20 +31,22 @@ bool build_attn(BuilderContext& ctx) {
+diff -ruN a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+--- a/src/codegen/builders/system.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/codegen/builders/system.cpp	2026-09-03 19:11:11.905610755 +0000
+@@ -31,20 +31,22 @@
  }
  
  bool build_sync(BuilderContext& ctx) {
@@ -93,11 +204,10 @@ index b2d70f5..9de7496 100644
    return true;
  }
  
-diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 1ddafd0..16e9fb1 100644
---- a/src/core/CMakeLists.txt
-+++ b/src/core/CMakeLists.txt
-@@ -54,8 +54,8 @@ if(WIN32)
+diff -ruN a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+--- a/src/core/CMakeLists.txt	2026-09-03 19:05:18.000000000 +0000
++++ b/src/core/CMakeLists.txt	2026-09-03 19:07:40.711798096 +0000
+@@ -54,8 +54,8 @@
      )
      target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
  elseif(UNIX)
@@ -108,7 +218,7 @@ index 1ddafd0..16e9fb1 100644
      target_sources(rexcore PRIVATE
          atomic_posix.cpp
          clock_posix.cpp
-@@ -74,6 +74,12 @@ elseif(UNIX)
+@@ -74,6 +74,12 @@
          system_posix.cpp
          threading_posix.cpp
      )
@@ -121,7 +231,7 @@ index 1ddafd0..16e9fb1 100644
  endif()
  
  # Xenos data-format layer (stateless; headers under include/rex/graphics/).
-@@ -100,6 +106,10 @@ target_include_directories(rexcore PRIVATE
+@@ -100,6 +106,10 @@
  
  if(APPLE)
      target_link_libraries(rexcore PRIVATE pthread)
@@ -132,11 +242,9 @@ index 1ddafd0..16e9fb1 100644
  elseif(UNIX)
      target_link_libraries(rexcore PRIVATE pthread rt dl)
  endif()
-diff --git a/src/core/android_runtime.cpp b/src/core/android_runtime.cpp
-new file mode 100644
-index 0000000..98a240c
---- /dev/null
-+++ b/src/core/android_runtime.cpp
+diff -ruN a/src/core/android_runtime.cpp b/src/core/android_runtime.cpp
+--- a/src/core/android_runtime.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/core/android_runtime.cpp	2026-09-03 19:10:35.461471733 +0000
 @@ -0,0 +1,278 @@
 +/**
 + ******************************************************************************
@@ -416,10 +524,9 @@ index 0000000..98a240c
 +}  // namespace rex
 +
 +#endif  // REX_PLATFORM_ANDROID
-diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
-index ef5bdf4..723b97d 100644
---- a/src/core/filesystem_posix.cpp
-+++ b/src/core/filesystem_posix.cpp
+diff -ruN a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+--- a/src/core/filesystem_posix.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/core/filesystem_posix.cpp	2026-09-03 19:11:39.683715504 +0000
 @@ -30,6 +30,10 @@
  #include <rex/platform/env.h>
  #include <rex/string.h>
@@ -431,7 +538,7 @@ index ef5bdf4..723b97d 100644
  #include <dirent.h>
  #include <ftw.h>
  #include <libgen.h>
-@@ -100,6 +104,15 @@ std::filesystem::path GetExecutablePath() {
+@@ -100,6 +104,15 @@
  }
  
  std::filesystem::path GetExecutableFolder() {
@@ -447,10 +554,9 @@ index ef5bdf4..723b97d 100644
    return GetExecutablePath().parent_path();
  }
  
-diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
-index b52bf39..2a97224 100644
---- a/src/core/memory_posix.cpp
-+++ b/src/core/memory_posix.cpp
+diff -ruN a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+--- a/src/core/memory_posix.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/core/memory_posix.cpp	2026-09-03 19:12:29.052902622 +0000
 @@ -51,7 +51,20 @@
  #include <dlfcn.h>
  #include <sys/ioctl.h>
@@ -472,11 +578,10 @@ index b52bf39..2a97224 100644
  
  // TODO(tomc): Android or maybe na. idk
  // #include "xenia/base/main_android.h"
-diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index b0c4004..612ac56 100644
---- a/src/system/xmemory.cpp
-+++ b/src/system/xmemory.cpp
-@@ -44,6 +44,13 @@ REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allo
+diff -ruN a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+--- a/src/system/xmemory.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/system/xmemory.cpp	2026-09-03 19:11:30.209679985 +0000
+@@ -44,6 +44,13 @@
  
  namespace rex::memory {
  
@@ -490,7 +595,7 @@ index b0c4004..612ac56 100644
  uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
    return rex::round_up(value, page_size) >> page_size_shift;
  }
-@@ -202,6 +209,10 @@ bool Memory::Initialize() {
+@@ -202,6 +209,10 @@
    heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
                                0x1FD00000, 4096, &heaps_.physical);
  
@@ -501,11 +606,10 @@ index b0c4004..612ac56 100644
    // Protect the first and last 64kb of memory.
    heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
                                memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
-diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
-index 5bd3dc5..38c39be 100644
---- a/src/ui/CMakeLists.txt
-+++ b/src/ui/CMakeLists.txt
-@@ -72,6 +72,10 @@ elseif(APPLE)
+diff -ruN a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+--- a/src/ui/CMakeLists.txt	2026-09-03 19:05:18.000000000 +0000
++++ b/src/ui/CMakeLists.txt	2026-09-03 19:07:52.738844621 +0000
+@@ -72,6 +72,10 @@
      set(REXUI_PLATFORM_SOURCES
          surface_mac.cpp
      )
@@ -516,7 +620,7 @@ index 5bd3dc5..38c39be 100644
  else()
      set(REXUI_PLATFORM_SOURCES
          surface_gnulinux.cpp
-@@ -146,7 +150,7 @@ if(REXGLUE_USE_VULKAN)
+@@ -146,7 +150,7 @@
  endif()
  
  # Platform-specific dependencies
@@ -525,7 +629,7 @@ index 5bd3dc5..38c39be 100644
      find_package(PkgConfig REQUIRED)
      pkg_check_modules(X11_XCB REQUIRED x11-xcb)
      # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
-@@ -161,6 +165,9 @@ if(UNIX AND NOT APPLE)
+@@ -161,6 +165,9 @@
          ${X11_XCB_LIBRARIES}
          ${WAYLAND_LIBRARIES}
      )
@@ -535,11 +639,9 @@ index 5bd3dc5..38c39be 100644
  elseif(APPLE)
      target_link_libraries(rexui PRIVATE "-framework CoreFoundation")
  endif()
-diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
-new file mode 100644
-index 0000000..da93534
---- /dev/null
-+++ b/src/ui/surface_android.cpp
+diff -ruN a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+--- a/src/ui/surface_android.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/ui/surface_android.cpp	2026-09-03 19:09:29.736219231 +0000
 @@ -0,0 +1,34 @@
 +/**
 + ******************************************************************************
@@ -575,10 +677,9 @@ index 0000000..da93534
 +
 +}  // namespace ui
 +}  // namespace rex
-diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index 2251429..da7e939 100644
---- a/src/ui/window_sdl.cpp
-+++ b/src/ui/window_sdl.cpp
+diff -ruN a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+--- a/src/ui/window_sdl.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/ui/window_sdl.cpp	2026-09-03 19:08:10.074911687 +0000
 @@ -35,9 +35,11 @@
  #include <SDL3/SDL_metal.h>
  
@@ -592,7 +693,7 @@ index 2251429..da7e939 100644
  #endif
  
  namespace rex::ui {
-@@ -149,6 +151,11 @@ bool WindowSDL::OpenImpl() {
+@@ -149,6 +151,11 @@
      REXLOG_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
      return false;
    }
@@ -604,7 +705,7 @@ index 2251429..da7e939 100644
    sdl_window_id_ = SDL_GetWindowID(sdl_window_);
    sdl_app_context().RegisterWindow(sdl_window_id_, this);
  
-@@ -398,7 +405,16 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+@@ -398,7 +405,16 @@
        SDL_Metal_DestroyView(metal_view);
      }
    }
@@ -622,11 +723,10 @@ index 2251429..da7e939 100644
    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
    if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
      auto* wl_display_ptr = static_cast<struct wl_display*>(
-diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
-index f102b56..30bbaf3 100644
---- a/thirdparty/CMakeLists.txt
-+++ b/thirdparty/CMakeLists.txt
-@@ -248,7 +248,13 @@ set(SDL_INSTALL ON CACHE BOOL "" FORCE)
+diff -ruN a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+--- a/thirdparty/CMakeLists.txt	2026-09-03 19:05:18.000000000 +0000
++++ b/thirdparty/CMakeLists.txt	2026-09-03 19:55:46.949852468 +0000
+@@ -248,7 +248,13 @@
  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
  set(SDL_STATIC ON CACHE BOOL "" FORCE)
  set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -641,19 +741,47 @@ index f102b56..30bbaf3 100644
  
  # Video provides the windowing/event layer; presenters create their own
  # D3D12/Vulkan surfaces from native handles, so SDL_RENDER stays off.
-@@ -290,7 +296,7 @@ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+@@ -290,15 +296,47 @@
  
  # Linux video and audio backends. Both video drivers are always built so the
  # one in use stays a runtime choice.
 -if(UNIX AND NOT APPLE)
+-    set(SDL_X11               ON  CACHE BOOL "" FORCE)
+-    set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
+-    set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
+-    set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
+-    set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
+-    set(SDL_PULSEAUDIO_SHARED ON  CACHE BOOL "" FORCE)
+-    set(SDL_PIPEWIRE          ON  CACHE BOOL "" FORCE)
+-    set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
 +if(UNIX AND NOT APPLE AND NOT ANDROID)
-     set(SDL_X11               ON  CACHE BOOL "" FORCE)
-     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
-     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
-@@ -300,6 +306,20 @@ if(UNIX AND NOT APPLE)
-     set(SDL_PIPEWIRE          ON  CACHE BOOL "" FORCE)
-     set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
- endif()
++    if(REXGLUE_ENABLE_DESKTOP_SDL_BACKENDS)
++        set(SDL_X11               ON  CACHE BOOL "" FORCE)
++        set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
++        set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
++        set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
++        set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
++        set(SDL_PULSEAUDIO_SHARED ON  CACHE BOOL "" FORCE)
++        set(SDL_PIPEWIRE          ON  CACHE BOOL "" FORCE)
++        set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
++    else()
++        # Headless hosts (CLI/codegen-only builds) have no desktop dev
++        # packages; SDL falls back to the dummy drivers, which is fine for the
++        # rexglue CLI that never opens a window.
++        set(SDL_X11               OFF CACHE BOOL "" FORCE)
++        set(SDL_WAYLAND           OFF CACHE BOOL "" FORCE)
++        set(SDL_ALSA              OFF CACHE BOOL "" FORCE)
++        set(SDL_ALSA_SHARED       OFF CACHE BOOL "" FORCE)
++        set(SDL_PULSEAUDIO        OFF CACHE BOOL "" FORCE)
++        set(SDL_PULSEAUDIO_SHARED OFF CACHE BOOL "" FORCE)
++        set(SDL_PIPEWIRE          OFF CACHE BOOL "" FORCE)
++        set(SDL_PIPEWIRE_SHARED   OFF CACHE BOOL "" FORCE)
++        set(SDL_JACK              OFF CACHE BOOL "" FORCE)
++        set(SDL_LIBUDEV           OFF CACHE BOOL "" FORCE)
++        set(SDL_DBUS              OFF CACHE BOOL "" FORCE)
++        set(SDL_IBUS              OFF CACHE BOOL "" FORCE)
++    endif()
++endif()
 +if(ANDROID)
 +    # Desktop backends must stay off (they would probe for X11/ALSA headers and
 +    # dlopen desktop libs); Android uses the android video driver + AAudio.
@@ -667,7 +795,6 @@ index f102b56..30bbaf3 100644
 +    set(SDL_DBUS      OFF CACHE BOOL "" FORCE)
 +    set(SDL_IBUS      OFF CACHE BOOL "" FORCE)
 +    set(SDL_VULKAN    ON  CACHE BOOL "" FORCE)
-+endif()
+ endif()
  
  add_subdirectory(sdl3)
- 
