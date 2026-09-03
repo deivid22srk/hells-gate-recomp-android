@@ -770,8 +770,8 @@ diff -ruN a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
  
 diff -ruN a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
 --- a/src/core/memory_posix.cpp	2026-09-03 19:05:18.000000000 +0000
-+++ b/src/core/memory_posix.cpp	2026-09-03 19:12:29.052902622 +0000
-@@ -51,7 +51,20 @@
++++ b/src/core/memory_posix.cpp	2026-09-03 22:12:10.187514860 +0000
+@@ -51,10 +51,25 @@
  #include <dlfcn.h>
  #include <sys/ioctl.h>
  
@@ -792,6 +792,46 @@ diff -ruN a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
  
  // TODO(tomc): Android or maybe na. idk
  // #include "xenia/base/main_android.h"
++
++#include <rex/main_android.h>  // rex::GetAndroidApiLevel (AndroidInitialize)
+ #endif
+ 
+ namespace rex {
+diff -ruN a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+--- a/src/core/threading_posix.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/core/threading_posix.cpp	2026-09-03 22:12:10.558516292 +0000
+@@ -270,8 +270,12 @@
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     // Use robust mutexes so waits can recover if owner thread terminates.
++    // NOTE: bionic does not implement the POSIX robust-mutex API (no
++    // pthread_mutexattr_setrobust / PTHREAD_MUTEX_ROBUST /
++    // pthread_mutex_consistent), so Android keeps plain std::mutex behavior
++    // and falls through to the #else paths below.
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+       if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0) {
+@@ -290,7 +294,7 @@
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -344,7 +348,7 @@
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {
 diff -ruN a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
 --- a/src/core/timer_queue.cpp	2026-09-03 19:05:18.000000000 +0000
 +++ b/src/core/timer_queue.cpp	2026-09-03 21:20:19.806574162 +0000
