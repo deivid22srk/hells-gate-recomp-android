@@ -156,6 +156,139 @@ diff -ruN a/include/rex/string/numeric.h b/include/rex/string/numeric.h
        auto result = detail::portable_float_from_chars(p, end, v.f32[i]);
  #else
        auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
+diff -ruN a/include/rex/thread/jthread_compat.h b/include/rex/thread/jthread_compat.h
+--- a/include/rex/thread/jthread_compat.h	1970-01-01 00:00:00.000000000 +0000
++++ b/include/rex/thread/jthread_compat.h	2026-09-03 21:20:06.031521910 +0000
+@@ -0,0 +1,129 @@
++/**
++ ******************************************************************************
++ * ReXGlue runtime (Android port): std::jthread / std::stop_token shim.
++ ******************************************************************************
++ * Android NDK ships libc++ from LLVM < 20, which does not provide
++ * std::jthread / std::stop_token (P0660/P2140, landed in libc++ 20). The
++ * only consumer in the runtime is TimerQueue, which polls
++ * stop_requested() from its dispatch thread and relies on the auto-join
++ * destructor; no stop_callback registrations exist. This shim implements
++ * exactly that subset on top of a shared atomic flag:
++ *   - stop_token::stop_requested()
++ *   - jthread: token-taking or argument-less callables, request_stop(),
++ *     join/joinable/get_id, auto-join on destruction
++ * On every other toolchain (libstdc++, libc++ >= 20, Apple, MSVC STL)
++ * these are plain aliases of the standard types, so behavior is unchanged.
++ */
++
++#pragma once
++
++#include <atomic>
++#include <memory>
++#include <thread>
++#include <type_traits>
++#include <utility>
++
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION < 200000 && !defined(__APPLE__)
++
++namespace rex::thread {
++
++class stop_token {
++ public:
++  stop_token() noexcept = default;
++
++  bool stop_requested() const noexcept {
++    return state_ && state_->load(std::memory_order_acquire);
++  }
++
++ private:
++  friend class jthread;
++  explicit stop_token(std::shared_ptr<std::atomic_bool> state) noexcept
++      : state_(std::move(state)) {}
++
++  std::shared_ptr<std::atomic_bool> state_;
++};
++
++class jthread {
++ public:
++  using id = std::thread::id;
++  using native_handle_type = std::thread::native_handle_type;
++
++  jthread() noexcept = default;
++
++  template <typename Callable,
++            typename = std::enable_if_t<
++                !std::is_same_v<std::decay_t<Callable>, jthread>>>
++  explicit jthread(Callable&& callable) {
++    token_ = stop_token(std::make_shared<std::atomic_bool>(false));
++    thread_ = std::thread(
++        [callable = std::forward<Callable>(callable), token = token_]() mutable {
++          if constexpr (std::is_invocable_v<Callable&, stop_token>) {
++            callable(std::move(token));
++          } else {
++            callable();
++          }
++        });
++  }
++
++  ~jthread() {
++    if (joinable()) {
++      request_stop();
++      join();
++    }
++  }
++
++  jthread(const jthread&) = delete;
++  jthread& operator=(const jthread&) = delete;
++
++  jthread(jthread&& other) noexcept
++      : thread_(std::move(other.thread_)), token_(std::move(other.token_)) {
++    other.token_ = stop_token();
++  }
++
++  jthread& operator=(jthread&& other) noexcept {
++    if (this != &other) {
++      if (joinable()) {
++        request_stop();
++        join();
++      }
++      thread_ = std::move(other.thread_);
++      token_ = std::move(other.token_);
++      other.token_ = stop_token();
++    }
++    return *this;
++  }
++
++  bool joinable() const noexcept { return thread_.joinable(); }
++  void join() { thread_.join(); }
++  void detach() { thread_.detach(); }
++  id get_id() const noexcept { return thread_.get_id(); }
++  native_handle_type native_handle() { return thread_.native_handle(); }
++
++  bool request_stop() noexcept {
++    if (!token_.state_) {
++      return false;
++    }
++    return token_.state_->exchange(true, std::memory_order_acq_rel) == false;
++  }
++
++  const stop_token& get_stop_token() const noexcept { return token_; }
++
++ private:
++  std::thread thread_;
++  stop_token token_;
++};
++
++}  // namespace rex::thread
++
++#else  // Standard library provides jthread natively.
++
++#include <stop_token>
++
++namespace rex::thread {
++
++using jthread = std::jthread;
++using stop_token = std::stop_token;
++
++}  // namespace rex::thread
++
++#endif
 diff -ruN a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
 --- a/include/rex/ui/surface_android.h	1970-01-01 00:00:00.000000000 +0000
 +++ b/include/rex/ui/surface_android.h	2026-09-03 19:09:22.122189843 +0000
@@ -632,6 +765,53 @@ diff -ruN a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
  
  // TODO(tomc): Android or maybe na. idk
  // #include "xenia/base/main_android.h"
+diff -ruN a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+--- a/src/core/timer_queue.cpp	2026-09-03 19:05:18.000000000 +0000
++++ b/src/core/timer_queue.cpp	2026-09-03 21:20:19.806574162 +0000
+@@ -19,6 +19,7 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
++#include <rex/thread/jthread_compat.h>
+ #include <rex/thread/timer_queue.h>
+ 
+ namespace dp = disruptorplus;
+@@ -40,7 +41,7 @@
+         consumed_(wait_strategy_) {
+     claim_strategy_.add_claim_barrier(consumed_);
+     dispatch_thread_ =
+-        std::jthread([this](std::stop_token stop_token) { TimerThreadMain(stop_token); });
++        jthread([this](stop_token stop_token) { TimerThreadMain(stop_token); });
+   }
+ 
+   ~TimerQueue() {
+@@ -55,7 +56,7 @@
+     // std::jthread auto-joins on destruction
+   }
+ 
+-  void TimerThreadMain(std::stop_token stop_token) {
++  void TimerThreadMain(stop_token stop_token) {
+     dp::sequence_t next_sequence = 0;
+     const auto comp = [](const std::shared_ptr<WaitItem>& left,
+                          const std::shared_ptr<WaitItem>& right) {
+@@ -136,7 +137,7 @@
+     return wait_item_weak;
+   }
+ 
+-  std::jthread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
++  jthread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
+ 
+  private:
+   // This ring buffer will be used to introduce timers queued by the public API
+@@ -149,7 +150,7 @@
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
+-  std::jthread dispatch_thread_;
++  jthread dispatch_thread_;
+ };
+ 
+ rex::thread::TimerQueue timer_queue_;
 diff -ruN a/src/system/xmemory.cpp b/src/system/xmemory.cpp
 --- a/src/system/xmemory.cpp	2026-09-03 19:05:18.000000000 +0000
 +++ b/src/system/xmemory.cpp	2026-09-03 19:11:30.209679985 +0000
