@@ -881,8 +881,8 @@ diff -ruN a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
  rex::thread::TimerQueue timer_queue_;
 diff -ruN a/src/core/ucontext_android.cpp b/src/core/ucontext_android.cpp
 --- a/src/core/ucontext_android.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/core/ucontext_android.cpp	2026-09-03 21:46:00.666458419 +0000
-@@ -0,0 +1,149 @@
++++ b/src/core/ucontext_android.cpp	2026-09-03 22:29:51.744572117 +0000
+@@ -0,0 +1,153 @@
 +/**
 + * @file        rex/core/ucontext_android.cpp
 + * @brief       Minimal getcontext/makecontext/swapcontext/setcontext for
@@ -921,24 +921,28 @@ diff -ruN a/src/core/ucontext_android.cpp b/src/core/ucontext_android.cpp
 +
 +extern "C" {
 +
-+// --- Layout pins (bionic arm64: uc_mcontext = struct sigcontext) -----------
++// --- Layout pins (bionic arm64: uc_mcontext = kernel struct sigcontext) ----
++// Derivation (bionic sys/ucontext.h, aarch64, LP64):
++//   uc_flags 0 | uc_link 8 | uc_stack 16 (stack_t 24B) | uc_sigmask union 40
++//   (kernel LP64 sigset_t = 8B) | __padding[128-8] -> 168 | uc_mcontext is
++//   16-byte aligned (mcontext __reserved has aligned(16)) -> ** 176 **.
 +static_assert(offsetof(ucontext_t, uc_flags) == 0, "bionic ucontext_t drift");
 +static_assert(offsetof(ucontext_t, uc_link) == 8, "bionic ucontext_t drift");
 +static_assert(offsetof(ucontext_t, uc_stack) == 16, "bionic ucontext_t drift");
 +static_assert(offsetof(ucontext_t, uc_sigmask) == 40, "bionic ucontext_t drift");
-+static_assert(offsetof(ucontext_t, uc_mcontext) == 80, "bionic ucontext_t drift");
++static_assert(offsetof(ucontext_t, uc_mcontext) == 176, "bionic ucontext_t drift");
 +static_assert(offsetof(mcontext_t, fault_address) == 0, "bionic mcontext_t drift");
 +static_assert(offsetof(mcontext_t, regs) == 8, "bionic mcontext_t drift");
 +static_assert(offsetof(mcontext_t, sp) == 256, "bionic mcontext_t drift");
 +static_assert(offsetof(mcontext_t, pc) == 264, "bionic mcontext_t drift");
 +static_assert(offsetof(mcontext_t, pstate) == 272, "bionic mcontext_t drift");
 +
-+// Register slots inside ucontext_t (uc_mcontext at 80, regs[] at +8):
-+//   regs[i]  -> 88 + 8*i;  sp -> 336;  pc -> 344;  pstate -> 352
-+#define REX_UC_REGS_BASE 88
-+#define REX_UC_SP 336
-+#define REX_UC_PC 344
-+#define REX_UC_PSTATE 352
++// Register slots inside ucontext_t (uc_mcontext at 176, regs[] at +8):
++//   regs[i]  -> 184 + 8*i;  sp -> 432;  pc -> 440;  pstate -> 448
++#define REX_UC_REGS_BASE 184
++#define REX_UC_SP 432
++#define REX_UC_PC 440
++#define REX_UC_PSTATE 448
 +
 +__attribute__((naked)) int getcontext(ucontext_t* ucp) {
 +  __asm__ volatile(

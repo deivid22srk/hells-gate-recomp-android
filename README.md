@@ -161,9 +161,13 @@ The **`default.xex` is required twice**: at build time (the `rexglue codegen`
 host tool translates the PowerPC code into C++ that is compiled into the APK)
 and at runtime (the loaded image supplies sections/imports). The rest of the
 extracted ISO (archives, media) is only needed at runtime, on the device.
-Because the XEX is copyrighted code, GitHub Actions **cannot** build the
-playable APK: CI builds a *framework APK* (full runtime, stub game code) that
-prompts for the game files when opened.
+Because the XEX is copyrighted code it is **never committed** to this
+repository. CI builds the **real, playable APK**: the workflow downloads
+`default.xex` at build time from the private repository
+(`hells-gate-recomp-Archive`) using the `PRIVATE_REPO_TOKEN` Actions secret,
+runs the codegen and compiles the game into the APK. Local builds read the
+XEX from `game/` on your machine - both paths end with the same playable
+result.
 
 ### Build the playable APK locally
 

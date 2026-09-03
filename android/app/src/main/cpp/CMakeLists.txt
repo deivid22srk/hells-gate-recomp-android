@@ -29,13 +29,12 @@ set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
 #--- SDK (patched tree) --------------------------------------------------------
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 
-#--- Generated (or stub) recompiled code ---------------------------------------
+#--- Generated recompiled code --------------------------------------------------
 set(REX_GEN_DIR "${REX_PROJECT_ROOT}/generated/default")
 if(NOT EXISTS "${REX_GEN_DIR}/sources.cmake")
     message(FATAL_ERROR
         "generated/default/sources.cmake is missing.\n"
-        "Framework build only: python3 scripts/stub_codegen.py\n"
-        "Full game build:      ./scripts/host-codegen.sh (needs game/default.xex)")
+        "Run ./scripts/host-codegen.sh first (needs game/default.xex - see README)")
 endif()
 include("${REX_GEN_DIR}/sources.cmake")
 

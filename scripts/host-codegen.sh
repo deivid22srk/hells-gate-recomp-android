@@ -32,7 +32,8 @@ echo "[host-codegen] Building the rexglue CLI (host, one time)..."
 cmake -S "${SDK_DIR}" -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DREXGLUE_ENABLE_TRACY=OFF \
-    -DREXGLUE_BUILD_TESTS=OFF
+    -DREXGLUE_BUILD_TESTS=OFF \
+    -DREXGLUE_ENABLE_DESKTOP_SDL_BACKENDS=OFF
 cmake --build "${BUILD_DIR}" --target rexglue -j"$(nproc)"
 
 REXGLUE_BIN="${SDK_DIR}/out/$(uname -s | tr '[:upper:]' '[:lower:]')-amd64/rexglue"

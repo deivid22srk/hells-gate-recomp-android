@@ -6,10 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Real, playable APK: the runner downloads YOUR default.xex from the private
+# repository (hells-gate-recomp-Archive) using the PRIVATE_REPO_TOKEN secret,
+# runs the rexglue codegen against it, and compiles the recompiled game code
+# into the APK. The XEX itself is never committed to this repository - it
+# exists only on the runner for the duration of the build.
+#
+# NOTE: the resulting APK embeds game code recompiled from your own dump.
+# Artifacts on a public repo are publicly downloadable - keep the token
+# (and the game files) in YOUR repos only.
+
 jobs:
-  # Validates that the patched SDK builds the host-side rexglue CLI cleanly
-  # (the codegen tool that translates the game's XEX into C++).
-  host-tools:
+  android-apk:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -29,41 +37,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-19
 
-      - name: Set up ReXGlue SDK (clone + patches)
-        run: ./scripts/setup-android.sh
-
-      - name: Build rexglue CLI (host)
-        env:
-          # The SDK hard-requires Clang (GCC fails the compiler check).
-          CC: clang-19
-          CXX: clang++-19
-        run: |
-          cmake -S thirdparty/rexglue-sdk -B out/host -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DREXGLUE_ENABLE_TRACY=OFF \
-            -DREXGLUE_BUILD_TESTS=OFF \
-            -DREXGLUE_ENABLE_DESKTOP_SDL_BACKENDS=OFF
-          cmake --build out/host --target rexglue -j"$(nproc)"
-
-      - name: Smoke-test CLI help
-        run: ./thirdparty/rexglue-sdk/out/linux-amd64/rexglue --help > /dev/null
-
-  # Builds the Android framework APK: the full native runtime (SDL3, FFmpeg,
-  # glslang, Vulkan backend) compiled for arm64-v8a with a stub generated-code
-  # tree. The game's default.xex is NEVER available here (copyright) - the
-  # playable APK is built locally with scripts/build-android.sh.
-  android-apk:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install ninja
+      - name: Install ninja ( Gradle's externalNativeBuild uses it via AGP CMake )
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
       - name: Set up ReXGlue SDK (clone + patches + submodules)
@@ -74,8 +54,33 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.1" >/dev/null
 
-      - name: Generate stub codegen (framework build, no game code)
-        run: python3 scripts/stub_codegen.py
+      - name: Download default.xex from the private repository
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET_URL="https://api.github.com/repos/deivid22srk/hells-gate-recomp-Archive/releases/assets/543190069"
+          curl -fL --retry 3 --retry-delay 5 \
+            -H "Authorization: Bearer ${PRIVATE_REPO_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o game/default.xex "${ASSET_URL}"
+          # Sanity check: the Dante's Inferno NTSC/U XEX is ~10.7 MB.
+          SIZE=$(stat -c%s game/default.xex)
+          echo "downloaded default.xex: ${SIZE} bytes"
+          [ "${SIZE}" -gt 10000000 ] || { echo "XEX too small - download failed"; exit 1; }
+          sha256sum game/default.xex
+
+      - name: Build rexglue CLI + run codegen (real game code)
+        env:
+          # The SDK hard-requires Clang (GCC fails the compiler check).
+          CC: clang-19
+          CXX: clang++-19
+        run: ./scripts/host-codegen.sh
+
+      - name: Verify generated code
+        run: |
+          test -f generated/default/sources.cmake
+          echo "generated sources:"; ls generated/default/*.cpp | wc -l
 
       - name: Gradle assembleDebug (arm64-v8a)
         run: |
@@ -83,9 +88,9 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Upload framework APK
+      - name: Upload playable APK
         uses: actions/upload-artifact@v4
         with:
-          name: dantes-inferno-framework-debug
+          name: dantes-inferno-android-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
