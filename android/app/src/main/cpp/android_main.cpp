@@ -74,10 +74,16 @@ std::string QueryNativeLibraryDir() {
 }
 
 JavaVM* QueryJavaVm() {
-  JavaVM* vm = nullptr;
-  jsize count = 0;
-  if (JNI_GetCreatedJavaVMs(&vm, 1, &count) == JNI_OK && count > 0 && vm) {
-    return vm;
+  // Pull the JavaVM from SDL3's process JNIEnv. (Calling JNI_GetCreatedJavaVMs
+  // directly would require linking against libart.so, which is not part of
+  // the NDK's public surface - the standard workaround is exactly what SDL
+  // already does for us here.)
+  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  if (env) {
+    JavaVM* vm = nullptr;
+    if (env->GetJavaVM(&vm) == JNI_OK && vm) {
+      return vm;
+    }
   }
   return nullptr;
 }
