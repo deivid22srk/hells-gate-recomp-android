@@ -11,8 +11,8 @@ android {
         applicationId = "com.deivid22srk.hellsgate"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
 
         // arm64-v8a only: the recompiled guest code, NEON paths and the
         // Vulkan backend are arm64-first; x86_64 emulator GPUs lack the

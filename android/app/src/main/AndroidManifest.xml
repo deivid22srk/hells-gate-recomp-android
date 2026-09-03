@@ -4,6 +4,15 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Read the picked game folder IN PLACE (no copy). On Android 11+ the
+         special "All files access" permission is required to open arbitrary
+         user folders by real path; on Android 9/10 the classic read
+         permission is enough. Sideloaded app: no Play policy concerns. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
     <!-- The recompiled Xenos GPU backend requires a full Vulkan implementation
          (independentBlend, storage atomics in fragment/vertex stages). -->
     <uses-feature

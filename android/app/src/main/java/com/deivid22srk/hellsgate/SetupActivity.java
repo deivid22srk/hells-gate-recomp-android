@@ -1,12 +1,18 @@
 package com.deivid22srk.hellsgate;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
 import android.provider.DocumentsContract;
+import android.provider.Settings;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
@@ -22,23 +28,38 @@ import java.util.ArrayList;
 
 /**
  * Onboarding: pick the folder with the extracted Xbox 360 game files
- * (default.xex + bigfile*.viv + ...) via the system folder picker (SAF), then
- * hand a native-accessible path to the SDL activity via game_root.txt.
+ * (default.xex + bigfile*.viv + ...) and hand a native-accessible path to the
+ * SDL activity via game_root.txt.
  *
- * Two strategies, in order of preference:
- *  1. Direct filesystem path reconstructed from the tree document id for
- *     primary storage (no copy; the SAF grant keeps the picker happy and the
- *     files are read in place).
- *  2. Copy the picked folder into the app's private storage (robust on every
- *     device; costs disk space equal to the game size).
+ * The game files are READ IN PLACE — nothing is ever copied into app storage
+ * (unless path resolution is impossible on an exotic device, see the very last
+ * fallback). To read arbitrary user folders directly, Android 11+ requires the
+ * special "All files access" permission (MANAGE_EXTERNAL_STORAGE), which is
+ * requested interactively from the system settings page. On Android 9/10 the
+ * classic READ_EXTERNAL_STORAGE runtime permission is enough (Android 10 may
+ * still need the copy fallback, since scoped storage cannot be bypassed there
+ * when targeting API 30+).
+ *
+ * Strategies, in order of preference:
+ *  1. Real filesystem path resolved from the SAF tree document id via
+ *     StorageVolume (primary storage, SD cards and USB OTG) — used directly,
+ *     no copy.
+ *  2. Copy the picked folder into app-private storage (last resort only, and
+ *     only after confirming the folder actually contains default.xex).
  */
 public class SetupActivity extends Activity {
 
     private static final int REQUEST_PICK_TREE = 1001;
+    private static final int REQUEST_READ_PERMISSION = 1002;
+
+    /** What to do when we come back from the system settings/permission UI. */
+    private static final int RESUME_NONE = 0;
+    private static final int RESUME_PICK_FOLDER = 1;
 
     private TextView statusText;
     private ProgressBar progress;
     private Button pickButton;
+    private int resumeAction = RESUME_NONE;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -72,15 +93,89 @@ public class SetupActivity extends Activity {
 
         pickButton = new Button(this);
         pickButton.setText(R.string.setup_pick);
-        pickButton.setOnClickListener(v -> launchPicker());
+        pickButton.setOnClickListener(v -> onPickClicked());
         root.addView(pickButton);
+
+        Button resetButton = new Button(this);
+        resetButton.setText(R.string.setup_reset);
+        resetButton.setOnClickListener(v -> resetConfig());
+        root.addView(resetButton);
 
         setContentView(root);
 
-        // Fast path: already configured and files still present.
+        // Fast path: already configured, access still granted and files still present.
         if (hasValidConfig()) {
             launchGame();
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Coming back from the "All files access" settings page (or the
+        // runtime permission dialog): continue where the user left off.
+        if (resumeAction == RESUME_PICK_FOLDER) {
+            resumeAction = RESUME_NONE;
+            if (hasValidConfig()) {
+                // Access was restored for a previously configured folder.
+                launchGame();
+            } else if (hasStorageAccess()) {
+                launchPicker();
+            }
+        }
+    }
+
+    private void onPickClicked() {
+        if (ensureStorageAccess()) {
+            launchPicker();
+        }
+    }
+
+    /**
+     * Makes sure the app can read the picked folder directly.
+     * Returns true when access is already granted; otherwise it redirects the
+     * user to the system UI that grants it and returns false (onResume
+     * continues the flow afterwards).
+     */
+    private boolean ensureStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
+                return true;
+            }
+            resumeAction = RESUME_PICK_FOLDER;
+            setStatus(R.string.setup_status_need_permission);
+            try {
+                startActivity(new Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (ActivityNotFoundException e) {
+                try {
+                    startActivity(new Intent(
+                            Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                } catch (Exception ignored) {
+                    toast(R.string.setup_status_no_settings);
+                }
+            }
+            return false;
+        }
+        // Android 9/10: classic runtime read permission.
+        if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        resumeAction = RESUME_PICK_FOLDER;
+        requestPermissions(new String[]{
+                android.Manifest.permission.READ_EXTERNAL_STORAGE},
+                REQUEST_READ_PERMISSION);
+        return false;
+    }
+
+    private boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
     }
 
     private void launchPicker() {
@@ -104,42 +199,90 @@ public class SetupActivity extends Activity {
                     Intent.FLAG_GRANT_READ_URI_PERMISSION);
         } catch (SecurityException ignored) {
         }
+        prefs().edit().putString("game_tree_uri", treeUri.toString()).apply();
         setStatus(R.string.setup_status_resolving);
         pickButton.setEnabled(false);
 
-        final String directPath = tryResolvePrimaryStoragePath(treeUri);
+        // Strategy 1: read the folder in place (no copy).
+        final String directPath = resolveDirectPath(treeUri);
         if (directPath != null && new File(directPath, "default.xex").isFile()) {
             finishSetup(directPath);
             return;
         }
 
-        // Fall back to copying the SAF tree into app-private storage.
+        // Before copying gigabytes, make sure the folder really holds the game.
+        if (!treeHasDefaultXex(treeUri)) {
+            pickButton.setEnabled(true);
+            setStatus(R.string.setup_status_missing);
+            return;
+        }
+
+        // Strategy 2 (last resort, exotic devices only): copy into app storage.
         toast(R.string.setup_copying);
         runCopyTask(treeUri);
     }
 
-    /** Best-effort reconstruction of the real path for primary storage trees. */
-    private String tryResolvePrimaryStoragePath(Uri treeUri) {
+    /**
+     * Resolves the real filesystem path of a SAF tree URI. Works for primary
+     * storage, SD cards and USB OTG (API 30+, via StorageVolume). Requires the
+     * "All files access" permission on Android 11+ to actually read the result.
+     */
+    private String resolveDirectPath(Uri treeUri) {
         try {
             String docId = DocumentsContract.getTreeDocumentId(treeUri);
             if (docId == null) {
                 return null;
             }
-            String[] parts = docId.split(":");
-            if (parts.length == 0 || !"primary".equals(parts[0])) {
-                return null; // Secondary storage/USB OTG: use the copy fallback.
-            }
-            String sub = parts.length > 1 ? parts[1] : "";
+            int colon = docId.indexOf(':');
+            String volumePart = colon >= 0 ? docId.substring(0, colon) : docId;
+            String sub = colon >= 0 ? docId.substring(colon + 1) : "";
             while (sub.startsWith("/")) {
                 sub = sub.substring(1);
             }
-            if (sub.isEmpty()) {
-                return "/storage/emulated/0";
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                StorageManager sm = (StorageManager) getSystemService(STORAGE_SERVICE);
+                for (StorageVolume volume : sm.getStorageVolumes()) {
+                    String uuid = volume.getUuid();
+                    boolean match = "primary".equals(volumePart)
+                            ? volume.isPrimary()
+                            : (uuid != null && uuid.equals(volumePart));
+                    File dir = volume.getDirectory();
+                    if (match && dir != null) {
+                        return sub.isEmpty()
+                                ? dir.getAbsolutePath()
+                                : new File(dir, sub).getAbsolutePath();
+                    }
+                }
             }
-            return "/storage/emulated/0/" + sub;
-        } catch (Exception e) {
-            return null;
+            // Legacy fallback for primary storage on older APIs.
+            if ("primary".equals(volumePart)) {
+                return sub.isEmpty()
+                        ? "/storage/emulated/0"
+                        : "/storage/emulated/0/" + sub;
+            }
+        } catch (Exception ignored) {
         }
+        return null;
+    }
+
+    /** Cheap SAF probe: does the ROOT of the picked tree contain default.xex? */
+    private boolean treeHasDefaultXex(Uri treeUri) {
+        try {
+            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri,
+                    DocumentsContract.getDocumentId(treeUri));
+            try (Cursor c = getContentResolver().query(childrenUri,
+                    new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME},
+                    null, null, null)) {
+                while (c != null && c.moveToNext()) {
+                    String name = c.getString(0);
+                    if (name != null && "default.xex".equalsIgnoreCase(name)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     private void runCopyTask(final Uri treeUri) {
@@ -154,7 +297,7 @@ public class SetupActivity extends Activity {
                 if (ok) {
                     finishSetup(destRoot.getAbsolutePath());
                 } else {
-                    setStatusText(getString(R.string.setup_status_missing));
+                    setStatus(R.string.setup_status_missing);
                 }
             });
         }, "game-copy").start();
@@ -182,7 +325,6 @@ public class SetupActivity extends Activity {
                     }
                 }
             }
-            // Ignore (non-fatal) if destDir already exists.
             if (!destDir.exists()) {
                 destDir.mkdirs();
             }
@@ -241,13 +383,55 @@ public class SetupActivity extends Activity {
                 w.println(gameRoot);
                 w.close();
             }
-            SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
-            prefs.edit().putString("game_root", gameRoot).apply();
+            prefs().edit().putString("game_root", gameRoot).apply();
             toast(R.string.setup_done);
+            // If a previous attempt fell back to copying, reclaim that space:
+            // the game is now read in place and the private copy is stale.
+            purgeStalePrivateCopy();
             launchGame();
         } catch (Exception e) {
             setStatusText("Failed to write config: " + e);
         }
+    }
+
+    /** Deletes a leftover in-app game copy (used before in-place access worked). */
+    private void purgeStalePrivateCopy() {
+        final File stale = new File(getFilesDir(), "game");
+        if (!stale.exists()) {
+            return;
+        }
+        new Thread(() -> deleteRecursively(stale), "purge-copy").start();
+    }
+
+    private static void deleteRecursively(File file) {
+        File[] children = file.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                deleteRecursively(child);
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
+    }
+
+    private void resetConfig() {
+        try {
+            File external = getExternalFilesDir(null);
+            if (external != null) {
+                //noinspection ResultOfMethodCallIgnored
+                new File(external, "game_root.txt").delete();
+            }
+            prefs().edit().remove("game_root").remove("game_tree_uri").apply();
+            deleteRecursively(new File(getFilesDir(), "game"));
+        } catch (Exception ignored) {
+        }
+        progress.setVisibility(View.GONE);
+        pickButton.setEnabled(true);
+        setStatus(R.string.setup_status_reset);
+    }
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences("settings", MODE_PRIVATE);
     }
 
     private boolean hasValidConfig() {
