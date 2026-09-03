@@ -1137,7 +1137,7 @@ diff -ruN a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
 +}  // namespace rex
 diff -ruN a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
 --- a/src/ui/window_sdl.cpp	2026-09-03 19:05:18.000000000 +0000
-+++ b/src/ui/window_sdl.cpp	2026-09-03 19:08:10.074911687 +0000
++++ b/src/ui/window_sdl.cpp	2026-09-03 22:52:41.718812110 +0000
 @@ -35,9 +35,11 @@
  #include <SDL3/SDL_metal.h>
  
@@ -1163,7 +1163,7 @@ diff -ruN a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
    sdl_window_id_ = SDL_GetWindowID(sdl_window_);
    sdl_app_context().RegisterWindow(sdl_window_id_, this);
  
-@@ -398,7 +405,16 @@
+@@ -398,7 +405,19 @@
        SDL_Metal_DestroyView(metal_view);
      }
    }
@@ -1171,8 +1171,11 @@ diff -ruN a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
 +#elif REX_PLATFORM_ANDROID
 +  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
 +    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
++    // NOTE: this SDL3 revision renamed the wiki's
++    // SDL_PROP_WINDOW_ANDROID_NATIVE_WINDOW_POINTER to
++    // SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER ("SDL.window.android.window").
 +    auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
-+        props, SDL_PROP_WINDOW_ANDROID_NATIVE_WINDOW_POINTER, nullptr));
++        props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
 +    if (native_window) {
 +      return std::make_unique<AndroidNativeWindowSurface>(native_window);
 +    }
