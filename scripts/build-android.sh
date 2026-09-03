@@ -18,7 +18,7 @@ if [ ! -f "generated/default/sources.cmake" ]; then
 fi
 
 echo "[build-android] Gradle assemble${VARIANT}..."
-./gradlew -p android "assemble${VARIANT^}"
+./gradlew -p android -PaliyunMirror=1 "assemble${VARIANT^}"
 
 APK="android/app/build/outputs/apk/${VARIANT}/app-${VARIANT}.apk"
 echo "[build-android] Done: ${APK}"
