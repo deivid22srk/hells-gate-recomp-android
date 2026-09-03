@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Validates that the patched SDK builds the host-side rexglue CLI cleanly
+  # (the codegen tool that translates the game's XEX into C++).
+  host-tools:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+
+      - name: Set up ReXGlue SDK (clone + patches)
+        run: ./scripts/setup-android.sh
+
+      - name: Build rexglue CLI (host)
+        run: |
+          cmake -S thirdparty/rexglue-sdk -B out/host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREXGLUE_ENABLE_TRACY=OFF \
+            -DREXGLUE_BUILD_TESTS=OFF
+          cmake --build out/host --target rexglue -j"$(nproc)"
+
+      - name: Smoke-test CLI help
+        run: ./thirdparty/rexglue-sdk/out/linux-amd64/rexglue --help > /dev/null
+
+  # Builds the Android framework APK: the full native runtime (SDL3, FFmpeg,
+  # glslang, Vulkan backend) compiled for arm64-v8a with a stub generated-code
+  # tree. The game's default.xex is NEVER available here (copyright) - the
+  # playable APK is built locally with scripts/build-android.sh.
+  android-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Set up ReXGlue SDK (clone + patches + submodules)
+        run: ./scripts/setup-android.sh
+
+      - name: Generate stub codegen (framework build, no game code)
+        run: python3 scripts/stub_codegen.py
+
+      - name: Gradle assembleDebug (arm64-v8a)
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload framework APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dantes-inferno-framework-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

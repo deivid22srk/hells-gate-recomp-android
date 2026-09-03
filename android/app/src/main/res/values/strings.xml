@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Dante\'s Inferno</string>
+    <string name="setup_title">Dante\'s Inferno — Android (Recomp)</string>
+    <string name="setup_help">1. Extraia a SUA cópia de Dante\'s Inferno (Xbox 360) para uma pasta no aparelho, mantendo a estrutura da ISO (default.xex, bigfile*.viv, etc.).\n2. Toque no botão abaixo e selecione essa pasta.\n\nOs arquivos do jogo não vêm com o app e não são distribuídos — use apenas o seu próprio dump. Se a pasta não puder ser aberta diretamente, o app copiará os arquivos para o armazenamento interno (requer espaço livre equivalente).</string>
+    <string name="setup_pick">Escolher pasta do jogo</string>
+    <string name="setup_status_idle">Aguardando seleção da pasta do jogo…</string>
+    <string name="setup_status_resolving">Resolvendo pasta selecionada…</string>
+    <string name="setup_status_missing">default.xex não encontrado na pasta selecionada. Verifique se a ISO foi extraída corretamente.</string>
+    <string name="setup_status_copied">Arquivos copiados: %1$d</string>
+    <string name="setup_copying">Não foi possível abrir a pasta diretamente — copiando para o armazenamento do app…</string>
+    <string name="setup_done">Configurado! Iniciando…</string>
+</resources>
