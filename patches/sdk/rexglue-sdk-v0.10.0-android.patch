@@ -51,6 +51,21 @@ diff -ruN a/CMakeLists.txt b/CMakeLists.txt
  endif()
  
  # Build config as compile definition (multi-config generators don't know config at configure time)
+diff -ruN a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+--- a/include/rex/chrono/chrono.h	2026-09-03 19:05:18.000000000 +0000
++++ b/include/rex/chrono/chrono.h	2026-09-03 20:55:05.613819802 +0000
+@@ -116,8 +116,9 @@
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || (defined(_LIBCPP_VERSION) && _LIBCPP_VERSION < 200000)
++// Apple libc++ (and Android NDK libc++ up to r27 / LLVM 19) do not expose
++// clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
 diff -ruN a/include/rex/main_android.h b/include/rex/main_android.h
 --- a/include/rex/main_android.h	1970-01-01 00:00:00.000000000 +0000
 +++ b/include/rex/main_android.h	2026-09-03 19:09:15.977166127 +0000
@@ -102,6 +117,45 @@ diff -ruN a/include/rex/main_android.h b/include/rex/main_android.h
 +}  // namespace rex
 +
 +#endif  // REX_PLATFORM_ANDROID
+diff -ruN a/include/rex/string/numeric.h b/include/rex/string/numeric.h
+--- a/include/rex/string/numeric.h	2026-09-03 19:05:18.000000000 +0000
++++ b/include/rex/string/numeric.h	2026-09-03 20:54:39.710727537 +0000
+@@ -26,7 +26,7 @@
+ #include <rex/string/utf8.h>
+ #include <rex/vec128.h>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ #include <locale.h>
+ #endif
+ 
+@@ -114,7 +114,7 @@
+   return result;
+ }
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ template <typename T>
+ inline std::from_chars_result portable_float_from_chars(const char* first, const char* last,
+                                                         T& value) {
+@@ -189,7 +189,7 @@
+     }
+     std::memcpy(&result, &pun, sizeof(PUN));
+   } else {
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+     auto [p, error] = portable_float_from_chars(range.data(), range.data() + range.size(), result);
+ #else
+     auto [p, error] = std::from_chars(range.data(), range.data() + range.size(), result,
+@@ -316,7 +316,7 @@
+         assert_always();
+         return vec128_t();
+       }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+       auto result = detail::portable_float_from_chars(p, end, v.f32[i]);
+ #else
+       auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
 diff -ruN a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
 --- a/include/rex/ui/surface_android.h	1970-01-01 00:00:00.000000000 +0000
 +++ b/include/rex/ui/surface_android.h	2026-09-03 19:09:22.122189843 +0000

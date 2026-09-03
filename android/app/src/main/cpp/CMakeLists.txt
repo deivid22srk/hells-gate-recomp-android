@@ -63,7 +63,7 @@ target_compile_options(recomp PRIVATE
     $<$<CXX_COMPILER_ID:Clang,AppleClang>:-gline-tables-only>
     -Wno-unused-variable
 )
-target_link_libraries(recomp PUBLIC rex::runtime)
+target_link_libraries(recomp PUBLIC rex::runtime rexui)
 
 #--- Android app library (loaded by SDLActivity via android.app.lib_name) ------
 add_library(main SHARED
@@ -79,7 +79,10 @@ target_include_directories(main PRIVATE
     "${REXSDK_DIR}/src/ui"
 )
 target_compile_options(main PRIVATE -Wno-unused-variable)
-target_link_libraries(main PRIVATE recomp rex::runtime)
+# rexui is linked here on purpose: it carries the imgui include dirs
+# (imgui itself is PRIVATE inside rex::runtime, so it does not propagate)
+# needed by <rex/ui/style.h> pulled in through rex_app.h.
+target_link_libraries(main PRIVATE recomp rex::runtime rexui)
 # The runtime resolves PPCImageConfig / PPCFuncMappings and the app creator
 # registration from this library.
 target_link_options(main PRIVATE -Wl,--export-dynamic)

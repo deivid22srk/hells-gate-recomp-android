@@ -17,7 +17,9 @@ jobs:
       - name: Install host toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang ninja-build
+          # libx11-xcb-dev / libwayland-dev: REQUIRED pkg-config deps of rexui
+          # (vulkan/api.h pulls <wayland-client.h>) even in headless CLI builds.
+          sudo apt-get install -y clang ninja-build libx11-xcb-dev libwayland-dev libwayland-client0
 
       - name: Set up ReXGlue SDK (clone + patches)
         run: ./scripts/setup-android.sh
@@ -31,7 +33,8 @@ jobs:
           cmake -S thirdparty/rexglue-sdk -B out/host -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DREXGLUE_ENABLE_TRACY=OFF \
-            -DREXGLUE_BUILD_TESTS=OFF
+            -DREXGLUE_BUILD_TESTS=OFF \
+            -DREXGLUE_ENABLE_DESKTOP_SDL_BACKENDS=OFF
           cmake --build out/host --target rexglue -j"$(nproc)"
 
       - name: Smoke-test CLI help
