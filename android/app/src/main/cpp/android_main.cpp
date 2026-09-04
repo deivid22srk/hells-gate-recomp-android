@@ -17,10 +17,12 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_system.h>
 
+#include <android/log.h>
 #include <dlfcn.h>
 #include <jni.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -44,6 +46,15 @@ namespace {
 
 constexpr char kAppIdentifier[] = "dantes_inferno";
 constexpr char kConfigFileName[] = "game_root.txt";
+// User-visible folder on primary shared storage for logs (so they can be
+// inspected with any file manager without rooting / adb). Writable only when
+// the All-Files-Access grant is in place; falls back to the app's own
+// external files dir otherwise.
+constexpr char kSharedLogRoot[] = "/storage/emulated/0/DantesInferno/logs";
+
+// Direct logcat output for failures that happen before logging is up.
+#define ALOGE(...) \
+  __android_log_print(ANDROID_LOG_ERROR, "dantes_inferno", __VA_ARGS__)
 
 std::string ReadTrimmedFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -97,6 +108,33 @@ void PrepareStorageDirs(const std::string& external_dir, const std::string& game
   }
 }
 
+// Picks the log directory: shared storage first (user-visible), the app's
+// external files dir as fallback (always writable). Probes writability so a
+// directory we cannot actually write never wins.
+std::string ResolveLogDir(const std::string& external_dir) {
+  const std::string candidates[] = {
+      kSharedLogRoot,
+      external_dir + "/logs",
+  };
+  for (const auto& dir : candidates) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec || !std::filesystem::is_directory(dir, ec)) {
+      continue;
+    }
+    const std::string probe = dir + "/.write_test";
+    {
+      std::ofstream out(probe, std::ios::binary);
+      if (!out) {
+        continue;
+      }
+    }
+    std::filesystem::remove(probe, ec);
+    return dir;
+  }
+  return external_dir + "/logs";
+}
+
 // Startup sequence mirrored from the SDK's windowed_app_main_sdl.cpp
 // (RunWindowedApp), resolving the app through the library-mode creator
 // registry (XE_UI_WINDOWED_APPS_IN_LIBRARY) instead of a link-time hook.
@@ -110,6 +148,7 @@ int RunAndroidApp(int argc, char** argv) {
   // below re-inits the (refcounted) subsystem.
   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
     REXLOG_ERROR("SDL_InitSubSystem(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
+    ALOGE("SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
     return EXIT_FAILURE;
   }
   const char* external_c = SDL_GetAndroidExternalStoragePath();
@@ -123,6 +162,7 @@ int RunAndroidApp(int argc, char** argv) {
   const std::string game_root = ReadTrimmedFile(config_path);
 
   PrepareStorageDirs(external_dir, game_root);
+  const std::string log_dir = ResolveLogDir(external_dir);
 
   rex::SetAndroidApplicationContext(java_vm, nullptr, lib_dir.c_str());
   rex::thread::AndroidInitialize();
@@ -138,10 +178,11 @@ int RunAndroidApp(int argc, char** argv) {
     REXLOG_ERROR("android_main: no game_root.txt under {} - the game data root "
                  "is unset (re-run setup)",
                  external_dir);
+    ALOGE("no game_root.txt under %s - re-run setup", external_dir.c_str());
   }
   args.emplace_back(fmt::format("--user_data_root={}", external_dir + "/data"));
   args.emplace_back(
-      fmt::format("--log_file={}", external_dir + "/logs/dantes_inferno.log"));
+      fmt::format("--log_file={}", log_dir + "/dantes_inferno.log"));
 
   std::vector<char*> argv_ptrs;
   argv_ptrs.reserve(args.size());
@@ -154,11 +195,28 @@ int RunAndroidApp(int argc, char** argv) {
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
 
+  // --- Diagnostic state (REXLOG now also reaches logcat on Android). ---
+  REXLOG_INFO("android_main: app={}", kAppIdentifier);
+  REXLOG_INFO("android_main: external_dir={}", external_dir);
+  REXLOG_INFO("android_main: log_dir={}", log_dir);
+  if (game_root.empty()) {
+    REXLOG_ERROR("android_main: game_data_root is unset (no game_root.txt)");
+  } else {
+    std::error_code xex_ec;
+    const bool xex_found =
+        std::filesystem::exists(game_root + "/default.xex", xex_ec);
+    REXLOG_INFO("android_main: game_data_root={} (default.xex {})", game_root,
+                xex_found ? std::string("found") : std::string("NOT FOUND"));
+  }
+
   int result;
   {
     rex::ui::SDLWindowedAppContext app_context;
     if (!app_context.Initialize()) {
-      return EXIT_FAILURE;
+      REXLOG_ERROR("android_main: SDLWindowedAppContext::Initialize failed: {}",
+                   SDL_GetError());
+      result = EXIT_FAILURE;
+      return result;
     }
 
     const auto creator = rex::ui::WindowedApp::GetCreator(kAppIdentifier);
@@ -166,16 +224,25 @@ int RunAndroidApp(int argc, char** argv) {
       REXLOG_ERROR("android_main: app '{}' is not registered - the recompiled "
                    "code was built from a different project name",
                    kAppIdentifier);
-      return EXIT_FAILURE;
+      result = EXIT_FAILURE;
+      return result;
     }
+    REXLOG_INFO("android_main: app registered, running OnInitialize...");
     std::unique_ptr<rex::ui::WindowedApp> app = creator(app_context);
 
     // No positional args on Android (paths are wired through cvars above).
-    result = app->OnInitialize() ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
+    if (app->OnInitialize()) {
+      result = app_context.RunMainMessageLoop();
+    } else {
+      REXLOG_ERROR("android_main: OnInitialize failed - see earlier errors "
+                   "from the app/runtime");
+      result = EXIT_FAILURE;
+    }
 
     app->InvokeOnDestroy();
   }
 
+  REXLOG_INFO("android_main: exiting with code {}", result);
   return result;
 }
 
