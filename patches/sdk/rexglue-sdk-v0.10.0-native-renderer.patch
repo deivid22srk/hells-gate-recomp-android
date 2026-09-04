@@ -16,7 +16,7 @@ index 2cf24c4..385a184 100644
  
  #if REX_HAS_D3D12
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..6388a45 100644
+index 696ff48..ae7eb02 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -29,6 +29,7 @@
@@ -27,15 +27,18 @@ index 696ff48..6388a45 100644
  #include <rex/graphics/vulkan/pipeline_cache.h>
  #include <rex/graphics/vulkan/primitive_processor.h>
  #include <rex/graphics/vulkan/render_target_cache.h>
-@@ -613,6 +614,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -613,6 +614,15 @@ class VulkanCommandProcessor : public CommandProcessor {
  
    std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
  
-+  // ARM-native frame renderer (rexgpu-native plugin only; null in the
-+  // rexgpu-xenos plugin - the class methods are compiled exclusively into the
-+  // native plugin, construction is guarded by REXGPU_NATIVE_FRAME_RENDERER).
++#ifdef REXGPU_NATIVE_FRAME_RENDERER
++  // ARM-native frame renderer (rexgpu-native plugin only; the class methods
++  // are compiled exclusively into the native plugin, so the member must not
++  // exist in the rexgpu-xenos build or its destructor reference would not
++  // link).
 +  std::unique_ptr<NativeFrameRenderer> native_frame_renderer_;
 +  friend class NativeFrameRenderer;
++#endif
 +
    std::unique_ptr<VulkanTextureCache> texture_cache_;
  
@@ -463,7 +466,7 @@ index 0000000..55a15af
 +  return nullptr;
 +}
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..b6ef7b1 100644
+index 001f36b..9491227 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -644,6 +644,11 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
@@ -564,11 +567,12 @@ index 001f36b..b6ef7b1 100644
    // Two iterations because a submission (even the current one - in which case
    // it needs to be ended, and a new one must be started) may need to be awaited
    // in case of a sampler count overflow, and if that happens, all subsystem
-@@ -3838,6 +3901,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3838,6 +3901,28 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
 +  VkPipeline pipeline = VK_NULL_HANDLE;
++#ifdef REXGPU_NATIVE_FRAME_RENDERER
 +  if (native_route == NativeFrameRenderer::DrawRoute::kNative) {
 +    // Native path: skip the render target cache entirely (the native frame
 +    // renderer owns the attachments for this draw) and get a pipeline created
@@ -586,11 +590,13 @@ index 001f36b..b6ef7b1 100644
 +      current_guest_graphics_pipeline_ = pipeline;
 +      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
 +    }
-+  } else {
++  } else
++#endif
++  {
    // Set up the render targets - this may perform dispatches and draws.
    if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                      normalized_color_mask, *vertex_shader)) {
-@@ -3847,7 +3929,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3847,7 +3932,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // Create the pipeline (for this, need the render pass from the render target
    // cache), translating the shaders - doing this now to obtain the used
    // textures.
@@ -598,7 +604,7 @@ index 001f36b..b6ef7b1 100644
    void* pipeline_handle = nullptr;
    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
                                            primitive_processing_result, normalized_depth_control,
-@@ -3873,6 +3954,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3873,6 +3957,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      current_guest_graphics_pipeline_ = pipeline;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
    }
@@ -606,7 +612,7 @@ index 001f36b..b6ef7b1 100644
  
    // Update the graphics pipeline, and if the new graphics pipeline has a
    // different layout, invalidate incompatible descriptor sets before updating
-@@ -4111,9 +4193,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,9 +4196,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -633,7 +639,7 @@ index 001f36b..b6ef7b1 100644
  
    // Draw.
    if (primitive_processing_result.index_buffer_type ==
-@@ -4386,6 +4482,18 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4386,6 +4485,18 @@ bool VulkanCommandProcessor::IssueCopy() {
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
@@ -676,10 +682,10 @@ index b49e033..d39bc0a 100644
          dfn.vkCmdClearColorImage(
 diff --git a/src/graphics/vulkan/native_frame_renderer.cpp b/src/graphics/vulkan/native_frame_renderer.cpp
 new file mode 100644
-index 0000000..8f40ca9
+index 0000000..6f9a139
 --- /dev/null
 +++ b/src/graphics/vulkan/native_frame_renderer.cpp
-@@ -0,0 +1,683 @@
+@@ -0,0 +1,686 @@
 +/**
 + * @file        vulkan/native_frame_renderer.cpp
 + * @brief       ARM-native frame renderer implementation
@@ -707,8 +713,8 @@ index 0000000..8f40ca9
 +#include <rex/system/xtypes.h>
 +#include <rex/ui/vulkan/util.h>
 +
-+namespace rex::graphics {
-+namespace vulkan {
++// Cvars at global scope (matching the flags.h declarations, like all the
++// other graphics cvars).
 +
 +REXCVAR_DEFINE_BOOL(native_render_enabled, true, "GPU",
 +                    "ARM-native frame renderer (Skate 3 Mobile-style): the main "
@@ -740,6 +746,9 @@ index 0000000..8f40ca9
 +REXCVAR_DEFINE_BOOL(native_render_log, false, "GPU",
 +                    "Log native frame routing statistics each swap.")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace rex::graphics {
++namespace vulkan {
 +
 +namespace {
 +
