@@ -30,6 +30,9 @@ git -C "${SDK_DIR}" apply "${REPO_ROOT}/patches/sdk/rexglue-sdk-v0.10.0.patch"
 echo "[setup-android] Applying Android port patch..."
 git -C "${SDK_DIR}" apply "${REPO_ROOT}/patches/sdk/rexglue-sdk-v0.10.0-android.patch"
 
+echo "[setup-android] Applying Android performance patch (fault-path, memexport, LTO diagnostics)..."
+git -C "${SDK_DIR}" apply "${REPO_ROOT}/patches/sdk/rexglue-sdk-v0.10.0-android-perf.patch"
+
 touch "${SDK_DIR}/.patches-applied"
 
 # Copy the SDL3 Android Java glue (SDLActivity + friends) into the app.

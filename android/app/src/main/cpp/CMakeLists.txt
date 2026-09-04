@@ -26,6 +26,18 @@ set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(REXGLUE_USE_VULKAN ON CACHE BOOL "" FORCE)
 set(REXGLUE_USE_D3D12 OFF CACHE BOOL "" FORCE)
 
+#--- Link-time optimization (ThinLTO) ------------------------------------------
+# The recompiled guest code is a monolith of small functions calling into the
+# runtime's memory access helpers on every guest load/store; cross-module
+# inlining of those helpers (plus dead-code stripping of the huge SDK surface)
+# is worth 5-15% on recompilation workloads. NDK r27 links with lld, which
+# consumes ThinLTO bitcode natively. Cost: slower builds and more link RAM on
+# CI. Applied to every target defined after this point (SDK, recompiled code,
+# app) for Release builds only.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
+
 #--- SDK (patched tree) --------------------------------------------------------
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 

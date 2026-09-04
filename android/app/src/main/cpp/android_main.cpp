@@ -194,6 +194,18 @@ int RunAndroidApp(int argc, char** argv) {
   args.emplace_back(
       fmt::format("--log_file={}", log_dir + "/dantes_inferno.log"));
 
+  // Performance (mobile memory bandwidth): the SDK's conservative default
+  // (clear_memory_page_state=true) invalidates every CPU-uploaded page at
+  // frame end, forcing the full vertex/index/texture working set through
+  // memcpy + vkCmdCopyBuffer every single frame. On a phone that alone can
+  // collapse the frame rate to ~1 FPS. CPU-side coherency is still enforced
+  // by the write-watch mechanism (uploads re-arm page protection; CPU writes
+  // fault, invalidate and re-upload), so this only removes the redundant
+  // per-frame re-upload. Hot-reloadable: pass
+  // --clear_memory_page_state=true to restore upstream behavior when
+  // debugging GPU/CPU memory coherency issues.
+  args.emplace_back("--clear_memory_page_state=false");
+
   std::vector<char*> argv_ptrs;
   argv_ptrs.reserve(args.size());
   for (auto& arg : args) {
