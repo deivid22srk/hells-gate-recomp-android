@@ -44,10 +44,10 @@ index 696ff48..ae7eb02 100644
  
    VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
-index 9d2a848..ad2d25c 100644
+index 9d2a848..b59702a 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
 +++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
-@@ -118,6 +118,22 @@ class DeferredCommandBuffer {
+@@ -118,6 +118,37 @@ class DeferredCommandBuffer {
      std::memcpy(args_ptr + offsets_offset, offsets, sizeof(VkDeviceSize) * binding_count);
    }
  
@@ -67,18 +67,36 @@ index 9d2a848..ad2d25c 100644
 +    std::memcpy(args_ptr + header_size, regions, sizeof(VkImageBlit) * region_count);
 +  }
 +
++  void CmdVkResolveImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
++                         VkImageLayout dst_image_layout, uint32_t region_count,
++                         const VkImageResolve* regions) {
++    const size_t header_size = rex::align(sizeof(ArgsVkResolveImage), alignof(VkImageResolve));
++    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
++        WriteCommand(Command::kVkResolveImage, header_size + sizeof(VkImageResolve) * region_count));
++    auto& args = *reinterpret_cast<ArgsVkResolveImage*>(args_ptr);
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region_count = region_count;
++    std::memcpy(args_ptr + header_size, regions, sizeof(VkImageResolve) * region_count);
++  }
++
    void CmdClearAttachmentsEmplace(uint32_t attachment_count, VkClearAttachment*& attachments_out,
                                    uint32_t rect_count, VkClearRect*& rects_out) {
      size_t arguments_size = rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment));
-@@ -359,6 +375,7 @@ class DeferredCommandBuffer {
+@@ -359,8 +390,10 @@ class DeferredCommandBuffer {
      kVkBindIndexBuffer,
      kVkBindPipeline,
      kVkBindVertexBuffers,
 +    kVkBlitImage,
      kVkClearAttachments,
      kVkClearColorImage,
++    kVkResolveImage,
      kVkCopyBuffer,
-@@ -450,6 +467,17 @@ class DeferredCommandBuffer {
+     kVkCopyBufferToImage,
+     kVkCopyQueryPoolResults,
+@@ -450,6 +483,27 @@ class DeferredCommandBuffer {
      static_assert(alignof(VkDeviceSize) <= alignof(uintmax_t));
    };
  
@@ -93,15 +111,25 @@ index 9d2a848..ad2d25c 100644
 +    static_assert(alignof(VkImageBlit) <= alignof(uintmax_t));
 +  };
 +
++  struct ArgsVkResolveImage {
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    uint32_t region_count;
++    // Followed by aligned VkImageResolve[].
++    static_assert(alignof(VkImageResolve) <= alignof(uintmax_t));
++  };
++
    struct ArgsVkClearAttachments {
      uint32_t attachment_count;
      uint32_t rect_count;
 diff --git a/include/rex/graphics/vulkan/native_frame_renderer.h b/include/rex/graphics/vulkan/native_frame_renderer.h
 new file mode 100644
-index 0000000..67220a2
+index 0000000..690492e
 --- /dev/null
 +++ b/include/rex/graphics/vulkan/native_frame_renderer.h
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,176 @@
 +/**
 + * @file        vulkan/native_frame_renderer.h
 + * @brief       ARM-native frame renderer for the Vulkan command processor
@@ -220,15 +248,22 @@ index 0000000..67220a2
 +    VkImage depth = VK_NULL_HANDLE;
 +    VkDeviceMemory depth_memory = VK_NULL_HANDLE;
 +    VkImageView depth_view = VK_NULL_HANDLE;
++    // Single-sample resolve destination for the color attachment (created
++    // only when samples != 1; blitting from a multisample source image is not
++    // allowed in Vulkan).
++    VkImage resolve = VK_NULL_HANDLE;
++    VkDeviceMemory resolve_memory = VK_NULL_HANDLE;
 +    VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
 +    VkFormat depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
++    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 +    uint32_t width = 0;
 +    uint32_t height = 0;
 +  };
 +
-+  bool EnsureFrameTargets(uint32_t width, uint32_t height);
++  bool EnsureFrameTargets(uint32_t width, uint32_t height, VkSampleCountFlagBits samples);
 +  void DestroyFrameTargets();
-+  bool EnsureRenderPass(VkFormat color_format, VkFormat depth_format);
++  bool EnsureRenderPass(VkFormat color_format, VkFormat depth_format,
++                        VkSampleCountFlagBits samples);
 +  bool EnsureFramebuffer(uint32_t width, uint32_t height);
 +
 +  VulkanCommandProcessor& command_processor_;
@@ -241,11 +276,22 @@ index 0000000..67220a2
 +  VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 +  VkFormat render_pass_color_format_ = VK_FORMAT_UNDEFINED;
 +  VkFormat render_pass_depth_format_ = VK_FORMAT_UNDEFINED;
++  VkSampleCountFlagBits render_pass_samples_ = VK_SAMPLE_COUNT_1_BIT;
 +  uint32_t framebuffer_width_ = 0;
 +  uint32_t framebuffer_height_ = 0;
 +  bool pass_open_ = false;
 +  bool frame_cleared_ = false;
 +  uint32_t frame_draw_count_ = 0;
++
++  // Per-frame routing statistics (reset at each present attempt).
++  uint32_t frame_skip_count_ = 0;
++  uint32_t frame_emulated_count_ = 0;
++  uint32_t frames_presented_ = 0;
++  uint32_t presents_logged_ = 0;
++  // One-shot routing diagnostics (kept across frames).
++  bool logged_first_native_route_ = false;
++  bool logged_first_skip_route_ = false;
++  bool logged_first_emulated_route_ = false;
 +
 +  // Last swap dimensions seen (target sizing between swaps).
 +  uint32_t last_swap_width_ = 0;
@@ -301,7 +347,7 @@ index 7b938b9..f8cbbf2 100644
    const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
    // <Submission index, pipeline>.
 diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
-index aa55a4a..2c9484c 100644
+index aa55a4a..107e1aa 100644
 --- a/include/rex/ui/vulkan/functions/device_1_0.inc
 +++ b/include/rex/ui/vulkan/functions/device_1_0.inc
 @@ -10,6 +10,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdBindDescriptorSets)
@@ -312,7 +358,15 @@ index aa55a4a..2c9484c 100644
  XE_UI_VULKAN_FUNCTION(vkCmdClearAttachments)
  XE_UI_VULKAN_FUNCTION(vkCmdClearColorImage)
  XE_UI_VULKAN_FUNCTION(vkCmdCopyBuffer)
-@@ -43,6 +44,7 @@ XE_UI_VULKAN_FUNCTION(vkCreateFramebuffer)
+@@ -17,6 +18,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdCopyBufferToImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyImageToBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkCmdDispatch)
++XE_UI_VULKAN_FUNCTION(vkCmdResolveImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdDraw)
+ XE_UI_VULKAN_FUNCTION(vkCmdDrawIndexed)
+ XE_UI_VULKAN_FUNCTION(vkCmdEndRenderPass)
+@@ -43,6 +45,7 @@ XE_UI_VULKAN_FUNCTION(vkCreateFramebuffer)
  XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
  XE_UI_VULKAN_FUNCTION(vkCreateImage)
  XE_UI_VULKAN_FUNCTION(vkCreateImageView)
@@ -320,7 +374,7 @@ index aa55a4a..2c9484c 100644
  XE_UI_VULKAN_FUNCTION(vkCreatePipelineLayout)
  XE_UI_VULKAN_FUNCTION(vkCreateQueryPool)
  XE_UI_VULKAN_FUNCTION(vkCreateRenderPass)
-@@ -58,6 +60,7 @@ XE_UI_VULKAN_FUNCTION(vkDestroyFence)
+@@ -58,6 +61,7 @@ XE_UI_VULKAN_FUNCTION(vkDestroyFence)
  XE_UI_VULKAN_FUNCTION(vkDestroyFramebuffer)
  XE_UI_VULKAN_FUNCTION(vkDestroyImage)
  XE_UI_VULKAN_FUNCTION(vkDestroyImageView)
@@ -328,7 +382,7 @@ index aa55a4a..2c9484c 100644
  XE_UI_VULKAN_FUNCTION(vkDestroyPipeline)
  XE_UI_VULKAN_FUNCTION(vkDestroyPipelineLayout)
  XE_UI_VULKAN_FUNCTION(vkDestroyQueryPool)
-@@ -71,6 +74,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
+@@ -71,6 +75,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
  XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
  XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
  XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
@@ -659,7 +713,7 @@ index 001f36b..9491227 100644
      return false;
    }
 diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
-index b49e033..d39bc0a 100644
+index b49e033..d480d29 100644
 --- a/src/graphics/vulkan/deferred_command_buffer.cpp
 +++ b/src/graphics/vulkan/deferred_command_buffer.cpp
 @@ -129,6 +129,17 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
@@ -680,12 +734,29 @@ index b49e033..d39bc0a 100644
        case Command::kVkClearColorImage: {
          auto& args = *reinterpret_cast<const ArgsVkClearColorImage*>(stream);
          dfn.vkCmdClearColorImage(
+@@ -138,6 +149,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                 rex::align(sizeof(ArgsVkClearColorImage), alignof(VkImageSubresourceRange))));
+       } break;
+ 
++      case Command::kVkResolveImage: {
++        auto& args = *reinterpret_cast<const ArgsVkResolveImage*>(stream);
++        dfn.vkCmdResolveImage(
++            command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++            args.dst_image_layout, args.region_count,
++            reinterpret_cast<const VkImageResolve*>(
++                reinterpret_cast<const uint8_t*>(stream) +
++                rex::align(sizeof(ArgsVkResolveImage), alignof(VkImageResolve))));
++      } break;
++
+       case Command::kVkCopyBuffer: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
+         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
 diff --git a/src/graphics/vulkan/native_frame_renderer.cpp b/src/graphics/vulkan/native_frame_renderer.cpp
 new file mode 100644
-index 0000000..6f9a139
+index 0000000..99cfafa
 --- /dev/null
 +++ b/src/graphics/vulkan/native_frame_renderer.cpp
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,829 @@
 +/**
 + * @file        vulkan/native_frame_renderer.cpp
 + * @brief       ARM-native frame renderer implementation
@@ -793,29 +864,75 @@ index 0000000..6f9a139
 +  if (!REXCVAR_GET(native_render_enabled)) {
 +    return DrawRoute::kEmulated;
 +  }
++  const RegisterFile& regs = *command_processor_.register_file_;
++  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++  auto log_route = [&](DrawRoute route) {
++    switch (route) {
++      case DrawRoute::kNative:
++        if (!logged_first_native_route_) {
++          logged_first_native_route_ = true;
++          REXLOG_INFO("NativeFrameRenderer: first NATIVE draw (pitch {}, msaa {}, memexport {}, "
++                      "rasterization {})",
++                      uint32_t(rb_surface_info.surface_pitch),
++                      uint32_t(rb_surface_info.msaa_samples), memexport_writes_possible,
++                      is_rasterization_done);
++        }
++        break;
++      case DrawRoute::kSkip:
++        if (!logged_first_skip_route_) {
++          logged_first_skip_route_ = true;
++          REXLOG_INFO("NativeFrameRenderer: first SKIPPED draw (pitch {}, msaa {}, memexport {}, "
++                      "rasterization {})",
++                      uint32_t(rb_surface_info.surface_pitch),
++                      uint32_t(rb_surface_info.msaa_samples), memexport_writes_possible,
++                      is_rasterization_done);
++        }
++        break;
++      case DrawRoute::kEmulated:
++        if (!logged_first_emulated_route_) {
++          logged_first_emulated_route_ = true;
++          REXLOG_INFO("NativeFrameRenderer: first EMULATED draw (pitch {}, msaa {}, memexport {}, "
++                      "rasterization {})",
++                      uint32_t(rb_surface_info.surface_pitch),
++                      uint32_t(rb_surface_info.msaa_samples), memexport_writes_possible,
++                      is_rasterization_done);
++        }
++        break;
++    }
++  };
++
 +  // Memexport draws must execute on the emulated path: their result is guest
 +  // memory the CPU reads back, the native frame cannot replace that.
 +  if (memexport_writes_possible) {
++    ++frame_emulated_count_;
++    log_route(DrawRoute::kEmulated);
 +    return DrawRoute::kEmulated;
 +  }
-+  const RegisterFile& regs = *command_processor_.register_file_;
 +  auto rb_modecontrol = regs.Get<reg::RB_MODECONTROL>();
 +  if (rb_modecontrol.edram_mode != xenos::EdramMode::kColorDepth) {
 +    // Copy/resolution modes are handled by IssueCopy - leave to the CP.
++    ++frame_emulated_count_;
++    log_route(DrawRoute::kEmulated);
 +    return DrawRoute::kEmulated;
 +  }
 +  if (!is_rasterization_done) {
 +    // Compute-style passes: nothing the native frame shows.
++    ++frame_skip_count_;
++    log_route(DrawRoute::kSkip);
 +    return DrawRoute::kSkip;
 +  }
-+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
 +  const int32_t min_pitch = REXCVAR_GET(native_render_min_pitch);
 +  if (int32_t(rb_surface_info.surface_pitch) < min_pitch) {
 +    // Render-to-texture / post chain / shadow map surface: suppressed, the
 +    // native frame does not consume its output (same policy as the Skate 3
 +    // port's suppression of the sub-framebuffer passes).
++    ++frame_skip_count_;
++    log_route(DrawRoute::kSkip);
 +    return DrawRoute::kSkip;
 +  }
++  // The draw is counted by RecordNativeDraw() once it is actually recorded
++  // into the native pass (RouteDraw only decides).
++  log_route(DrawRoute::kNative);
 +  return DrawRoute::kNative;
 +}
 +
@@ -851,8 +968,10 @@ index 0000000..6f9a139
 +  return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
 +}
 +
-+bool NativeFrameRenderer::EnsureFrameTargets(uint32_t width, uint32_t height) {
-+  if (targets_.width == width && targets_.height == height && targets_.color != VK_NULL_HANDLE) {
++bool NativeFrameRenderer::EnsureFrameTargets(uint32_t width, uint32_t height,
++                                             VkSampleCountFlagBits samples) {
++  if (targets_.width == width && targets_.height == height && targets_.samples == samples &&
++      targets_.color != VK_NULL_HANDLE) {
 +    return true;
 +  }
 +  // (Re)creating targets while the pass is open is not allowed - close it;
@@ -888,6 +1007,7 @@ index 0000000..6f9a139
 +
 +  targets_.width = width;
 +  targets_.height = height;
++  targets_.samples = samples;
 +
 +  VkImageCreateInfo image_create_info;
 +  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -899,7 +1019,7 @@ index 0000000..6f9a139
 +  image_create_info.extent.depth = 1;
 +  image_create_info.mipLevels = 1;
 +  image_create_info.arrayLayers = 1;
-+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_create_info.samples = samples;
 +  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
 +  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 +  image_create_info.queueFamilyIndexCount = 0;
@@ -924,6 +1044,22 @@ index 0000000..6f9a139
 +          targets_.depth, targets_.depth_memory)) {
 +    REXLOG_ERROR("NativeFrameRenderer: failed to create the {}x{} depth target", width, height);
 +    return false;
++  }
++
++  if (samples != VK_SAMPLE_COUNT_1_BIT) {
++    // Multisample color cannot be blitted - resolve into a single-sample
++    // image of the same format first (at swap time).
++    image_create_info.format = targets_.color_format;
++    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_create_info.usage =
++        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++            vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++            targets_.resolve, targets_.resolve_memory)) {
++      REXLOG_ERROR("NativeFrameRenderer: failed to create the {}x{} resolve target", width,
++                   height);
++      return false;
++    }
 +  }
 +
 +  VkImageViewCreateInfo view_create_info;
@@ -951,19 +1087,23 @@ index 0000000..6f9a139
 +    return false;
 +  }
 +
-+  if (!EnsureRenderPass(targets_.color_format, targets_.depth_format) ||
++  if (!EnsureRenderPass(targets_.color_format, targets_.depth_format, samples) ||
 +      !EnsureFramebuffer(width, height)) {
 +    return false;
 +  }
++
++  // Newly created attachments hold no meaningful content - make sure the
++  // next first draw of the next frame clears instead of loading garbage.
++  frame_cleared_ = false;
 +
 +  // Undefined -> (attachment initial layouts) transition happens via the
 +  // render pass first use with UNDEFINED initial layouts + LOAD op clear on
 +  // the first draw of the frame; until then the images live in UNDEFINED,
 +  // which Vulkan allows for attachments discarding previous contents.
 +  REXLOG_INFO("NativeFrameRenderer: {}x{} native frame targets created "
-+              "(color {}, depth {})",
-+              width, height, uint32_t(targets_.color_format),
-+              uint32_t(targets_.depth_format));
++              "(color {}, depth {}, samples {})",
++              width, height, uint32_t(targets_.color_format), uint32_t(targets_.depth_format),
++              uint32_t(samples));
 +  return true;
 +}
 +
@@ -986,6 +1126,14 @@ index 0000000..6f9a139
 +    dfn.vkDestroyImageView(device, targets_.depth_view, nullptr);
 +    targets_.depth_view = VK_NULL_HANDLE;
 +  }
++  if (targets_.resolve != VK_NULL_HANDLE) {
++    dfn.vkDestroyImage(device, targets_.resolve, nullptr);
++    targets_.resolve = VK_NULL_HANDLE;
++  }
++  if (targets_.resolve_memory != VK_NULL_HANDLE) {
++    dfn.vkFreeMemory(device, targets_.resolve_memory, nullptr);
++    targets_.resolve_memory = VK_NULL_HANDLE;
++  }
 +  if (targets_.color != VK_NULL_HANDLE) {
 +    dfn.vkDestroyImage(device, targets_.color, nullptr);
 +    targets_.color = VK_NULL_HANDLE;
@@ -1004,11 +1152,13 @@ index 0000000..6f9a139
 +  }
 +  targets_.width = 0;
 +  targets_.height = 0;
++  targets_.samples = VK_SAMPLE_COUNT_1_BIT;
 +}
 +
-+bool NativeFrameRenderer::EnsureRenderPass(VkFormat color_format, VkFormat depth_format) {
++bool NativeFrameRenderer::EnsureRenderPass(VkFormat color_format, VkFormat depth_format,
++                                           VkSampleCountFlagBits samples) {
 +  if (render_pass_ != VK_NULL_HANDLE && render_pass_color_format_ == color_format &&
-+      render_pass_depth_format_ == depth_format) {
++      render_pass_depth_format_ == depth_format && render_pass_samples_ == samples) {
 +    return true;
 +  }
 +  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
@@ -1025,7 +1175,7 @@ index 0000000..6f9a139
 +  // stored, transitions to TRANSFER_SRC for the swap blit.
 +  attachments[0].flags = 0;
 +  attachments[0].format = color_format;
-+  attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
++  attachments[0].samples = samples;
 +  attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
 +  attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 +  attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -1036,7 +1186,7 @@ index 0000000..6f9a139
 +  // frames until cleared by the first draw), DONT_CARE store.
 +  attachments[1].flags = 0;
 +  attachments[1].format = depth_format;
-+  attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
++  attachments[1].samples = samples;
 +  attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
 +  attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 +  attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -1099,6 +1249,7 @@ index 0000000..6f9a139
 +  }
 +  render_pass_color_format_ = color_format;
 +  render_pass_depth_format_ = depth_format;
++  render_pass_samples_ = samples;
 +  return true;
 +}
 +
@@ -1141,7 +1292,21 @@ index 0000000..6f9a139
 +  kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
 +  uint32_t width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
 +  uint32_t height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
-+  if (!EnsureFrameTargets(width, height)) {
++
++  // Host attachment sample count must match the pipelines created through the
++  // render pass key: 1 << guest MSAA samples, with the render target cache's
++  // 2x-to-4x fallback when 2-sample attachments are unsupported by the device
++  // (the pipeline cache applies the same fallback, including its sample mask).
++  const RegisterFile& regs = *command_processor_.register_file_;
++  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++  VkSampleCountFlagBits samples =
++      VkSampleCountFlagBits(uint32_t(1) << uint32_t(rb_surface_info.msaa_samples));
++  if (rb_surface_info.msaa_samples == xenos::MsaaSamples::k2X &&
++      !command_processor_.render_target_cache_->msaa_2x_attachments_supported()) {
++    samples = VK_SAMPLE_COUNT_4_BIT;
++  }
++
++  if (!EnsureFrameTargets(width, height, samples)) {
 +    return false;
 +  }
 +
@@ -1157,15 +1322,17 @@ index 0000000..6f9a139
 +      // UNDEFINED (discarding previous contents - they are fully cleared
 +      // below). The blit at PresentFrame leaves the color image in
 +      // TRANSFER_SRC, so it must come back to the attachment layout here.
-+      VkImageSubresourceRange subresource_range =
++      VkImageSubresourceRange color_subresource_range =
 +          ui::vulkan::util::InitializeSubresourceRange();
++      VkImageSubresourceRange depth_subresource_range = ui::vulkan::util::InitializeSubresourceRange(
++          VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 +      command_processor_.PushImageMemoryBarrier(
-+          targets_.color, subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++          targets_.color, color_subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 +          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
 +          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
 +          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 +      command_processor_.PushImageMemoryBarrier(
-+          targets_.depth, subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++          targets_.depth, depth_subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 +          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 +          0,
 +          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
@@ -1223,6 +1390,15 @@ index 0000000..6f9a139
 +    // No native content this frame - let the emulated swap run (it keeps the
 +    // previous frontbuffer, which is the correct fallback for menus that
 +    // render entirely through suppressed surfaces... or reload screens).
++    if (presents_logged_ < 5) {
++      REXLOG_INFO("NativeFrameRenderer: swap with no native content (draws {}, skipped {}, "
++                  "emulated {}) - falling back to the emulated presentation",
++                  frame_draw_count_, frame_skip_count_, frame_emulated_count_);
++    }
++    ++frames_presented_;
++    frame_draw_count_ = 0;
++    frame_skip_count_ = 0;
++    frame_emulated_count_ = 0;
 +    return false;
 +  }
 +  if (pass_open_) {
@@ -1233,20 +1409,52 @@ index 0000000..6f9a139
 +    command_processor_.in_render_pass_ = false;
 +  }
 +
-+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
-+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-+
 +  // Transition the native color target to a transfer source, the guest output
 +  // for the transfer write (contents fully overwritten - UNDEFINED old
-+  // layout, mirroring the compute gamma path), blit (scales + converts
-+  // formats), then release the guest output back to the presenter's internal
-+  // layout.
++  // layout, mirroring the compute gamma path), resolve (if multisampled),
++  // blit (scales + converts formats), then release the guest output back to
++  // the presenter's internal layout.
 +  VkImageSubresourceRange subresource_range = ui::vulkan::util::InitializeSubresourceRange();
 +  command_processor_.PushImageMemoryBarrier(
 +      targets_.color, subresource_range, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 +      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 +      VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 +      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++
++  VkImage transfer_source_image = targets_.color;
++  VkImageLayout transfer_source_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  if (targets_.samples != VK_SAMPLE_COUNT_1_BIT && targets_.resolve != VK_NULL_HANDLE) {
++    // vkCmdBlitImage requires single-sample sources - resolve the multisample
++    // color attachment into the dedicated single-sample image first.
++    command_processor_.PushImageMemoryBarrier(
++        targets_.resolve, subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    command_processor_.SubmitBarriers(true);
++
++    VkImageResolve resolve_region = {};
++    resolve_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    resolve_region.srcSubresource.mipLevel = 0;
++    resolve_region.srcSubresource.baseArrayLayer = 0;
++    resolve_region.srcSubresource.layerCount = 1;
++    resolve_region.srcOffset = {0, 0, 0};
++    resolve_region.dstSubresource = resolve_region.srcSubresource;
++    resolve_region.dstOffset = {0, 0, 0};
++    resolve_region.extent = {targets_.width, targets_.height, 1};
++    command_processor_.deferred_command_buffer().CmdVkResolveImage(
++        targets_.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, targets_.resolve,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &resolve_region);
++
++    command_processor_.PushImageMemoryBarrier(
++        targets_.resolve, subresource_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    command_processor_.SubmitBarriers(true);
++    transfer_source_image = targets_.resolve;
++  } else {
++    command_processor_.SubmitBarriers(true);
++  }
++
 +  command_processor_.PushImageMemoryBarrier(
 +      guest_output_image, subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 +      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1264,7 +1472,7 @@ index 0000000..6f9a139
 +  blit.dstOffsets[0] = {0, 0, 0};
 +  blit.dstOffsets[1] = {int32_t(guest_output_width), int32_t(guest_output_height), 1};
 +  command_processor_.deferred_command_buffer().CmdVkBlitImage(
-+      targets_.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, guest_output_image,
++      transfer_source_image, transfer_source_layout, guest_output_image,
 +      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 +
 +  command_processor_.PushImageMemoryBarrier(
@@ -1274,14 +1482,20 @@ index 0000000..6f9a139
 +      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 +      ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
 +
-+  if (REXCVAR_GET(native_render_log)) {
-+    REXLOG_INFO("NativeFrameRenderer: frame presented, {} native draws, {}x{} -> {}x{}",
-+                frame_draw_count_, targets_.width, targets_.height, guest_output_width,
-+                guest_output_height);
++  if (REXCVAR_GET(native_render_log) || presents_logged_ < 5) {
++    ++presents_logged_;
++    REXLOG_INFO("NativeFrameRenderer: frame presented, {} native draws, {} skipped, {} emulated, "
++                "{}x{} -> {}x{}, samples {}",
++                frame_draw_count_, frame_skip_count_, frame_emulated_count_, targets_.width,
++                targets_.height, guest_output_width, guest_output_height,
++                uint32_t(targets_.samples));
 +  }
 +
 +  // Reset for the next guest frame.
++  ++frames_presented_;
 +  frame_draw_count_ = 0;
++  frame_skip_count_ = 0;
++  frame_emulated_count_ = 0;
 +  frame_cleared_ = false;
 +  return true;
 +}
@@ -1508,3 +1722,23 @@ index 91ac08f..4c7f337 100644
    if (create_result != VK_SUCCESS) {
      uint64_t ps_hash = creation_arguments.pixel_shader
                             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..885aeb7 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1488,8 +1488,13 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+   image_create_info.arrayLayers = 1;
+   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+-  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++  // TRANSFER_DST is required for the ARM-native frame renderer's blit into
++  // the guest output at swap time (PresentFrame). The emulated paths only
++  // ever read/store/sample this image - the extra usage bit is inert for
++  // them.
++  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                            VK_IMAGE_USAGE_STORAGE_BIT;
+   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   image_create_info.queueFamilyIndexCount = 0;
+   image_create_info.pQueueFamilyIndices = nullptr;
