@@ -142,6 +142,11 @@ int RunAndroidApp(int argc, char** argv) {
   // --- Android glue setup (before any runtime subsystem spins threads). ---
   const std::string lib_dir = QueryNativeLibraryDir();
   JavaVM* java_vm = QueryJavaVm();
+  if (lib_dir.empty()) {
+    ALOGE("nativeLibraryDir unresolved - GPU plugin staging will fail");
+  } else {
+    ALOGE("nativeLibraryDir: %s", lib_dir.c_str());
+  }
 
   // SDL video init is required before SDL_GetAndroidExternalStoragePath can
   // resolve the Java-side storage paths. SDLWindowedAppContext::Initialize()
@@ -164,7 +169,12 @@ int RunAndroidApp(int argc, char** argv) {
   PrepareStorageDirs(external_dir, game_root);
   const std::string log_dir = ResolveLogDir(external_dir);
 
-  rex::SetAndroidApplicationContext(java_vm, nullptr, lib_dir.c_str());
+  // The activity object enables the SDK's Java bridges (content:// fd
+  // opening). It is optional in the SDK glue - the native library dir is
+  // wired independently - but SDL has the live MainActivity here, so hand
+  // it over (it must be used in this same native frame: local JNI ref).
+  rex::SetAndroidApplicationContext(java_vm, SDL_GetAndroidActivity(),
+                                    lib_dir.c_str());
   rex::thread::AndroidInitialize();
   rex::memory::AndroidInitialize();
   rex::filesystem::AndroidInitialize();

@@ -91,6 +91,15 @@ target_link_libraries(main PRIVATE recomp rex::runtime rexui)
 # registration from this library.
 target_link_options(main PRIVATE -Wl,--export-dynamic)
 
+# The GPU emulation plugin (librexgpu-xenos.so) is runtime-loaded by the SDK's
+# rex::system::LoadGpuPlugin via dlopen from the app's nativeLibraryDir - it
+# must never be linked into main, only built and packaged. AGP packages every
+# shared library target of this CMake project into the APK, and the SDK's
+# CMAKE_BUILD_TYPE=Release config leaves the file name unpostfixed, matching
+# the loader's REXGLUE_BUILD_CONFIG-based name (useLegacyPackaging=true in
+# build.gradle.kts extracts it next to libmain.so on install).
+add_dependencies(main rexgpu-xenos)
+
 # Keep the output names stable for the GPU plugin loader (lib prefix already
 # added by CMake for SHARED libs).
 set_target_properties(main PROPERTIES

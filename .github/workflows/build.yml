@@ -88,6 +88,18 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
 
+      - name: Verify APK packages the GPU plugin
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$APK" > /tmp/apk_contents.txt
+          cat /tmp/apk_contents.txt
+          grep -q "lib/arm64-v8a/libmain.so" /tmp/apk_contents.txt || {
+            echo "ERROR: libmain.so missing from APK"; exit 1; }
+          grep -Eq "lib/arm64-v8a/librexgpu-xenos.*\.so" /tmp/apk_contents.txt || {
+            echo "ERROR: GPU plugin (librexgpu-xenos*.so) missing from APK -"; \
+            echo "       LoadGpuPlugin would fail at runtime (dlopen from nativeLibraryDir)"; exit 1; }
+          echo "OK: libmain.so and the GPU plugin are packaged."
+
       - name: Upload playable APK
         uses: actions/upload-artifact@v4
         with:
