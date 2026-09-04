@@ -1,7 +1,7 @@
 diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/graphics/native/native_pipeline_cache.h
 --- a/include/rex/graphics/native/native_pipeline_cache.h	1970-01-01 00:00:00.000000000 +0000
-+++ b/include/rex/graphics/native/native_pipeline_cache.h	2026-09-04 14:00:09.394558441 +0000
-@@ -0,0 +1,179 @@
++++ b/include/rex/graphics/native/native_pipeline_cache.h	2026-09-04 15:27:35.168382592 +0000
+@@ -0,0 +1,194 @@
 +/**
 + * @file        graphics/native/native_pipeline_cache.h
 + * @brief       Persistent driver-level Vulkan pipeline cache for the
@@ -55,6 +55,17 @@ diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/gr
 +
 +namespace rex::graphics::vulkan::native {
 +
++// Loader-level entry points the cache needs, injected by the caller (the
++// Vulkan backend) from the SDK's already-loaded VulkanInstance dispatch
++// table. The GPU plugin never links libvulkan directly (the loader is
++// dlopen'ed by the runtime), so these must NOT be referenced as global
++// symbols from this library - doing so fails to link with undefined
++// vkGetDeviceProcAddr / vkGetPhysicalDeviceProperties.
++struct LoaderFunctions {
++  PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
++  PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
++};
++
 +class PersistentPipelineCache {
 + public:
 +  // Four shards: enough to keep the async creation workers and the processor
@@ -73,7 +84,8 @@ diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/gr
 +  // mismatch means the driver's cache format changed - the blob is ignored
 +  // and will be replaced by the next save).
 +  void Initialize(VkPhysicalDevice physical_device, VkDevice device,
-+                  const std::filesystem::path& blob_path);
++                  const std::filesystem::path& blob_path,
++                  const LoaderFunctions& loader_functions);
 +
 +  // Scoped access to one shard's VkPipelineCache for a single
 +  // vkCreateGraphicsPipelines call. Invalid (VK_NULL_HANDLE) when the
@@ -151,6 +163,8 @@ diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/gr
 +
 +  VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
 +  VkDevice device_ = VK_NULL_HANDLE;
++  PFN_vkGetDeviceProcAddr get_device_proc_addr_fn_ = nullptr;
++  PFN_vkGetPhysicalDeviceProperties physical_device_properties_fn_ = nullptr;
 +  std::filesystem::path blob_path_;
 +  uint64_t max_blob_bytes_ = 0;
 +  std::unique_ptr<Shard[]> shards_;
@@ -165,7 +179,8 @@ diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/gr
 +// No-op if the native persistent pipeline cache cvar is disabled or this was
 +// already initialized (there is exactly one VulkanPipelineCache per process).
 +void InitializePersistentPipelineCache(VkPhysicalDevice physical_device, VkDevice device,
-+                                       const std::filesystem::path& blob_path);
++                                       const std::filesystem::path& blob_path,
++                                       const LoaderFunctions& loader_functions);
 +
 +// Returns the process-wide pool, or nullptr when disabled/uninitialized.
 +PersistentPipelineCache* GetPersistentPipelineCache();
@@ -182,7 +197,7 @@ diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/gr
 +
 +#endif  // REX_GRAPHICS_NATIVE_NATIVE_PIPELINE_CACHE_H_
 diff -ruN a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
---- a/src/graphics/CMakeLists.txt	2026-09-04 14:59:17.086333995 +0000
+--- a/src/graphics/CMakeLists.txt	2026-09-04 15:32:20.632053627 +0000
 +++ b/src/graphics/CMakeLists.txt	2026-09-04 14:59:12.344322983 +0000
 @@ -158,3 +158,80 @@
          dxguid
@@ -267,8 +282,8 @@ diff -ruN a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 +endif()
 diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/native_pipeline_cache.cpp
 --- a/src/graphics/native/native_pipeline_cache.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/graphics/native/native_pipeline_cache.cpp	2026-09-04 14:15:12.365762053 +0000
-@@ -0,0 +1,403 @@
++++ b/src/graphics/native/native_pipeline_cache.cpp	2026-09-04 15:27:42.534400271 +0000
+@@ -0,0 +1,420 @@
 +/**
 + * @file        graphics/native/native_pipeline_cache.cpp
 + * @brief       Persistent driver-level Vulkan pipeline cache implementation.
@@ -339,17 +354,24 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +          .count());
 +}
 +
-+// Device-level entry points, resolved once per VkDevice (the pool outlives
-+// everything but the device; resolved per instance to stay self-contained -
-+// no dependency on the SDK's dispatch tables from this TU).
++// Device-level entry points, resolved once per VkDevice. The loader-level
++// entry points (device proc addr, physical device properties) are injected
++// by the caller from the SDK's VulkanInstance dispatch table - this library
++// does not link libvulkan, so referencing those symbols directly would fail
++// to link (undefined vkGetDeviceProcAddr / vkGetPhysicalDeviceProperties).
 +struct DeviceFunctions {
 +  PFN_vkCreatePipelineCache create_pipeline_cache = nullptr;
 +  PFN_vkDestroyPipelineCache destroy_pipeline_cache = nullptr;
 +  PFN_vkMergePipelineCaches merge_pipeline_caches = nullptr;
 +  PFN_vkGetPipelineCacheData get_pipeline_cache_data = nullptr;
 +
-+  explicit DeviceFunctions(VkDevice device) {
-+    auto get = [device](const char* name) { return vkGetDeviceProcAddr(device, name); };
++  explicit DeviceFunctions(VkDevice device, PFN_vkGetDeviceProcAddr get_device_proc_addr) {
++    if (!get_device_proc_addr) {
++      return;
++    }
++    auto get = [device, get_device_proc_addr](const char* name) {
++      return get_device_proc_addr(device, name);
++    };
 +    create_pipeline_cache =
 +        reinterpret_cast<PFN_vkCreatePipelineCache>(get("vkCreatePipelineCache"));
 +    destroy_pipeline_cache =
@@ -376,7 +398,8 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +}
 +
 +void PersistentPipelineCache::Initialize(VkPhysicalDevice physical_device, VkDevice device,
-+                                         const std::filesystem::path& blob_path) {
++                                         const std::filesystem::path& blob_path,
++                                         const LoaderFunctions& loader_functions) {
 +  if (device_ != VK_NULL_HANDLE) {
 +    return;
 +  }
@@ -385,9 +408,17 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +  blob_path_ = blob_path;
 +  max_blob_bytes_ = uint64_t(REXCVAR_GET(native_pipeline_cache_max_mb)) * 1024ull * 1024ull;
 +
++  if (!loader_functions.vkGetDeviceProcAddr || !loader_functions.vkGetPhysicalDeviceProperties) {
++    REXGPU_WARN("NativePipelineCache: loader function pointers unavailable, disabled");
++    device_ = VK_NULL_HANDLE;
++    return;
++  }
++  physical_device_properties_fn_ = loader_functions.vkGetPhysicalDeviceProperties;
++  get_device_proc_addr_fn_ = loader_functions.vkGetDeviceProcAddr;
++
 +  VkPhysicalDeviceProperties properties;
-+  vkGetPhysicalDeviceProperties(physical_device_, &properties);
-+  const DeviceFunctions dfn(device_);
++  physical_device_properties_fn_(physical_device_, &properties);
++  const DeviceFunctions dfn(device_, get_device_proc_addr_fn_);
 +
 +  // Read + validate the previous run's blob (if any).
 +  std::vector<uint8_t> seed;
@@ -491,7 +522,7 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +    return;
 +  }
 +
-+  const DeviceFunctions dfn(device_);
++  const DeviceFunctions dfn(device_, get_device_proc_addr_fn_);
 +
 +  // Merge every unlocked shard into shard 0. Busy shards are skipped (unless
 +  // shutting down, where all creation threads are already joined) - their
@@ -568,7 +599,7 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +      return;
 +    }
 +    VkPhysicalDeviceProperties properties;
-+    vkGetPhysicalDeviceProperties(physical_device_, &properties);
++    physical_device_properties_fn_(physical_device_, &properties);
 +    BlobHeader header{};
 +    header.magic = kBlobMagic;
 +    header.version = kBlobVersion;
@@ -604,8 +635,8 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +}
 +
 +void PersistentPipelineCache::DestroyShards() {
-+  if (device_ != VK_NULL_HANDLE && shards_) {
-+    const DeviceFunctions dfn(device_);
++  if (device_ != VK_NULL_HANDLE && shards_ && get_device_proc_addr_fn_) {
++    const DeviceFunctions dfn(device_, get_device_proc_addr_fn_);
 +    for (uint32_t i = 0; i < kShardCount; ++i) {
 +      if (shards_[i].cache != VK_NULL_HANDLE && dfn.destroy_pipeline_cache) {
 +        dfn.destroy_pipeline_cache(device_, shards_[i].cache, nullptr);
@@ -631,13 +662,14 @@ diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/
 +// --- Process-wide accessors -------------------------------------------------
 +
 +void InitializePersistentPipelineCache(VkPhysicalDevice physical_device, VkDevice device,
-+                                       const std::filesystem::path& blob_path) {
++                                       const std::filesystem::path& blob_path,
++                                       const LoaderFunctions& loader_functions) {
 +  if (!REXCVAR_GET(native_persistent_pipeline_cache)) {
 +    REXGPU_INFO("NativePipelineCache: disabled by cvar");
 +    return;
 +  }
 +  static PersistentPipelineCache pool;
-+  pool.Initialize(physical_device, device, blob_path);
++  pool.Initialize(physical_device, device, blob_path, loader_functions);
 +}
 +
 +PersistentPipelineCache* GetPersistentPipelineCache() { return g_persistent_pipeline_cache; }
@@ -734,8 +766,8 @@ diff -ruN a/src/graphics/native/plugin_main_native.cpp b/src/graphics/native/plu
 +  return nullptr;
 +}
 diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
---- a/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:59:17.144334128 +0000
-+++ b/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:06:18.302458396 +0000
+--- a/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 15:32:20.677053735 +0000
++++ b/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 15:28:15.618476406 +0000
 @@ -49,6 +49,10 @@
  #include <rex/types.h>
  #include <rex/ui/vulkan/util.h>
@@ -747,7 +779,7 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
  REXCVAR_DEFINE_INT32(
      vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
      "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
-@@ -396,6 +400,23 @@
+@@ -396,6 +400,32 @@
      startup_loading_ = false;
    }
  
@@ -761,9 +793,18 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
 +    const ui::vulkan::VulkanDevice* const native_vulkan_device =
 +        command_processor_.GetVulkanDevice();
 +    if (native_vulkan_device) {
++      // Loader-level entry points come from the SDK's already-populated
++      // instance dispatch table: the plugin is not linked against libvulkan
++      // (the loader is dlopen'ed by the runtime), so direct references to
++      // vkGetDeviceProcAddr / vkGetPhysicalDeviceProperties would fail to
++      // link.
++      const auto& native_instance_functions =
++          native_vulkan_device->vulkan_instance()->functions();
 +      native::InitializePersistentPipelineCache(
 +          native_vulkan_device->physical_device(), native_vulkan_device->device(),
-+          cache_root / "pipelines" / fmt::format("{:08X}", title_id) / "vkcache.bin");
++          cache_root / "pipelines" / fmt::format("{:08X}", title_id) / "vkcache.bin",
++          native::LoaderFunctions{native_instance_functions.vkGetDeviceProcAddr,
++                                  native_instance_functions.vkGetPhysicalDeviceProperties});
 +    }
 +  }
 +#endif  // REXGPU_NATIVE
@@ -771,7 +812,7 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
    auto shader_storage_root = cache_root / "shaders";
    auto shader_storage_shareable_root = shader_storage_root / "shareable";
    if (!std::filesystem::exists(shader_storage_shareable_root)) {
-@@ -744,6 +765,12 @@
+@@ -744,6 +774,12 @@
  }
  
  void VulkanPipelineCache::EndSubmission() {
@@ -784,7 +825,7 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
    if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
      {
        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-@@ -818,6 +845,12 @@
+@@ -818,6 +854,12 @@
  
    ShutdownShaderStorage();
  
@@ -797,7 +838,7 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -3480,8 +3513,29 @@
+@@ -3480,8 +3522,29 @@
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
    VkPipeline pipeline;
@@ -828,7 +869,7 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
      uint64_t ps_hash = creation_arguments.pixel_shader
                             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
 diff -ruN a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
---- a/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:59:17.558335121 +0000
+--- a/src/graphics/vulkan/texture_cache.cpp	2026-09-04 15:32:21.058054650 +0000
 +++ b/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:05:52.042396774 +0000
 @@ -35,6 +35,19 @@
  
