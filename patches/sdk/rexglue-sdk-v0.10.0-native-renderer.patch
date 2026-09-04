@@ -182,9 +182,9 @@ diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/gr
 +
 +#endif  // REX_GRAPHICS_NATIVE_NATIVE_PIPELINE_CACHE_H_
 diff -ruN a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
---- a/src/graphics/CMakeLists.txt	2026-09-04 14:28:08.750696578 +0000
-+++ b/src/graphics/CMakeLists.txt	2026-09-04 14:06:54.494544574 +0000
-@@ -158,3 +158,73 @@
+--- a/src/graphics/CMakeLists.txt	2026-09-04 14:59:17.086333995 +0000
++++ b/src/graphics/CMakeLists.txt	2026-09-04 14:59:12.344322983 +0000
+@@ -158,3 +158,80 @@
          dxguid
      )
  endif()
@@ -204,11 +204,18 @@ diff -ruN a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 +# Loaded with --gpu_plugin=native. Never linked by consumers; staged next to
 +# the executable / into the APK like rexgpu-xenos.
 +if(REXGLUE_USE_VULKAN)
++    # The native plugin ships its own entry points
++    # (native/plugin_main_native.cpp: rex_gpu_abi_version / rex_gpu_create).
++    # plugin_main.cpp - the xenos entry - must NOT be compiled into this
++    # target: both define the same C symbols and the .so would fail to link
++    # with duplicate-symbol errors.
++    set(REXGPU_NATIVE_SOURCES ${REXGPU_XENOS_SOURCES})
++    list(REMOVE_ITEM REXGPU_NATIVE_SOURCES plugin_main.cpp)
 +    set(REXGPU_NATIVE_EXTRA_SOURCES
 +        native/native_pipeline_cache.cpp
 +        native/plugin_main_native.cpp
 +    )
-+    add_library(rexgpu-native SHARED ${REXGPU_XENOS_SOURCES} ${REXGPU_NATIVE_EXTRA_SOURCES})
++    add_library(rexgpu-native SHARED ${REXGPU_NATIVE_SOURCES} ${REXGPU_NATIVE_EXTRA_SOURCES})
 +    add_library(rex::gpu-native ALIAS rexgpu-native)
 +
 +    set_target_properties(rexgpu-native PROPERTIES
@@ -727,7 +734,7 @@ diff -ruN a/src/graphics/native/plugin_main_native.cpp b/src/graphics/native/plu
 +  return nullptr;
 +}
 diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
---- a/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:28:08.794696684 +0000
+--- a/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:59:17.144334128 +0000
 +++ b/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:06:18.302458396 +0000
 @@ -49,6 +49,10 @@
  #include <rex/types.h>
@@ -821,7 +828,7 @@ diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipelin
      uint64_t ps_hash = creation_arguments.pixel_shader
                             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
 diff -ruN a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
---- a/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:28:09.244697767 +0000
+--- a/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:59:17.558335121 +0000
 +++ b/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:05:52.042396774 +0000
 @@ -35,6 +35,19 @@
  
