@@ -14,4 +14,8 @@
     <string name="setup_done">Configurado! Iniciando…</string>
     <string name="setup_reset">Limpar configuração</string>
     <string name="setup_status_reset">Configuração limpa. Selecione a pasta do jogo novamente.</string>
+    <string name="setup_play">Iniciar jogo</string>
+    <string name="setup_status_ready">Jogo configurado e pronto.</string>
+    <string name="setup_renderer_label">Renderizador nativo (experimental)</string>
+    <string name="setup_renderer_summary">Ligado: renderizador nativo ARM (rexgpu-native) — cache persistente de pipelines do driver + texturas comprimidas BCn (mais rápido após a 2ª execução). Desligado: renderizador original (rexgpu-xenos). A mudança vale na próxima vez que o jogo iniciar.</string>
 </resources>

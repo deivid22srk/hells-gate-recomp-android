@@ -1,0 +1,1033 @@
+diff -ruN a/include/rex/graphics/native/native_pipeline_cache.h b/include/rex/graphics/native/native_pipeline_cache.h
+--- a/include/rex/graphics/native/native_pipeline_cache.h	1970-01-01 00:00:00.000000000 +0000
++++ b/include/rex/graphics/native/native_pipeline_cache.h	2026-09-04 14:00:09.394558441 +0000
+@@ -0,0 +1,179 @@
++/**
++ * @file        graphics/native/native_pipeline_cache.h
++ * @brief       Persistent driver-level Vulkan pipeline cache for the
++ *              rexgpu-native ARM Android renderer plugin.
++ *
++ * @remarks     Why this exists (evidence from Android field logs, Adreno 619):
++ *              the Xenos Vulkan backend calls vkCreateGraphicsPipelines with
++ *              VK_NULL_HANDLE as the pipeline cache, so the driver recompiles
++ *              every pipeline from scratch on EVERY application run
++ *              (100-250 ms per pipeline on a Cortex-A73). With 1000+
++ *              unique pipeline variants, that is minutes of GPU-thread /
++ *              worker-thread compile time per session, and frames using
++ *              not-yet-created pipelines are skipped - the perceived result
++ *              is roughly 1 FPS.
++ *
++ *              This component keeps a driver-owned VkPipelineCache alive
++ *              across runs: the driver blob (VkPhysicalDeviceProperties::
++ *              pipelineCacheUUID-keyed) is loaded at startup, seeded into
++ *              sharded VkPipelineCache objects used directly for pipeline
++ *              creation, and merged back to disk periodically and at
++ *              shutdown. On the second and later runs the driver resolves
++ *              previously compiled pipeline binaries from the cache, which
++ *              is what makes the startup prewarm pass finish in seconds
++ *              instead of minutes on mobile SoCs.
++ *
++ *              Concurrency model: pipeline creation happens on multiple
++ *              host threads (startup prewarm workers, async creation
++ *              workers, and the processor thread fallback). Creation is
++ *              spread across kShardCount independent VkPipelineCache objects
++ *              (shard = atomic round-robin), each guarded by its own mutex,
++ *              so unrelated creations proceed in parallel while every cache
++ *              still has single-thread access semantics. Saving merges
++ *              unlocked shards into shard 0 (try-lock based, so a periodic
++ *              save never blocks a compiling worker) and writes the blob
++ *              atomically (tmp file + rename).
++ *
++ * @copyright   Copyright (c) 2026 hells-gate-recomp-android contributors
++ * @license     BSD 3-Clause License
++ */
++
++#ifndef REX_GRAPHICS_NATIVE_NATIVE_PIPELINE_CACHE_H_
++#define REX_GRAPHICS_NATIVE_NATIVE_PIPELINE_CACHE_H_
++
++#include <atomic>
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <mutex>
++
++#include <vulkan/vulkan.h>
++
++namespace rex::graphics::vulkan::native {
++
++class PersistentPipelineCache {
++ public:
++  // Four shards: enough to keep the async creation workers and the processor
++  // thread from serializing each other on a 4x big.LITTLE phone, while
++  // bounding the worst-case driver memory used by the seeded cache data.
++  static constexpr uint32_t kShardCount = 4;
++
++  PersistentPipelineCache() = default;
++  ~PersistentPipelineCache();
++
++  PersistentPipelineCache(const PersistentPipelineCache&) = delete;
++  PersistentPipelineCache& operator=(const PersistentPipelineCache&) = delete;
++
++  // Creates the shard caches. Seeds each shard with the on-disk blob when it
++  // exists and its pipelineCacheUUID matches this physical device (a UUID
++  // mismatch means the driver's cache format changed - the blob is ignored
++  // and will be replaced by the next save).
++  void Initialize(VkPhysicalDevice physical_device, VkDevice device,
++                  const std::filesystem::path& blob_path);
++
++  // Scoped access to one shard's VkPipelineCache for a single
++  // vkCreateGraphicsPipelines call. Invalid (VK_NULL_HANDLE) when the
++  // persistent cache is disabled or not initialized.
++  class CreationSlot {
++   public:
++    CreationSlot() = default;
++    CreationSlot(PersistentPipelineCache* cache, uint32_t shard, VkPipelineCache cache_handle,
++                 std::unique_lock<std::mutex>&& lock)
++        : cache_(cache), shard_(shard), cache_handle_(cache_handle), lock_(std::move(lock)) {}
++    CreationSlot(CreationSlot&& other) noexcept { MoveFrom(other); }
++    CreationSlot& operator=(CreationSlot&& other) noexcept {
++      if (this != &other) {
++        Release();
++        MoveFrom(other);
++      }
++      return *this;
++    }
++    ~CreationSlot() { Release(); }
++
++    explicit operator bool() const { return cache_handle_ != VK_NULL_HANDLE; }
++    VkPipelineCache cache() const { return cache_handle_; }
++    uint32_t shard() const { return shard_; }
++
++    // Marks the persistent blob as needing a save after a successful creation.
++    void MarkDirty();
++    // Requests that the blob not be persisted (poisoned by a driver rejection).
++    void Poison();
++
++   private:
++    void MoveFrom(CreationSlot& other) {
++      cache_ = other.cache_;
++      shard_ = other.shard_;
++      cache_handle_ = other.cache_handle_;
++      lock_ = std::move(other.lock_);
++      other.cache_ = nullptr;
++      other.shard_ = 0;
++      other.cache_handle_ = VK_NULL_HANDLE;
++    }
++    void Release();
++
++    PersistentPipelineCache* cache_ = nullptr;
++    uint32_t shard_ = 0;
++    VkPipelineCache cache_handle_ = VK_NULL_HANDLE;
++    std::unique_lock<std::mutex> lock_;
++  };
++
++  // Picks a free-ish shard (round-robin) and locks it for one creation call.
++  CreationSlot BeginCreation();
++
++  // Merges shards that are not currently compiling into shard 0 and writes
++  // the blob when the content is dirty. Never blocks on busy shards unless
++  // wait_for_busy is true (used at shutdown, when creation threads are
++  // already joined). Bounded by max_blob_bytes.
++  void Save(bool wait_for_busy);
++
++  // Full teardown: merge everything, save, destroy the shard caches. Must be
++  // called while the VkDevice is still alive (before device destruction) and
++  // after all pipeline creation threads have been joined.
++  void Shutdown();
++
++  // Periodic save entry point (GPU thread): saves when dirty and the interval
++  // has elapsed; cheap no-op otherwise.
++  void MaybeSavePeriodic();
++
++  bool initialized() const { return device_ != VK_NULL_HANDLE; }
++
++ private:
++  struct Shard {
++    std::mutex mutex;
++    VkPipelineCache cache = VK_NULL_HANDLE;
++  };
++
++  void DestroyShards();
++
++  VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
++  VkDevice device_ = VK_NULL_HANDLE;
++  std::filesystem::path blob_path_;
++  uint64_t max_blob_bytes_ = 0;
++  std::unique_ptr<Shard[]> shards_;
++  std::atomic<uint32_t> next_shard_{0};
++  std::atomic<bool> dirty_{false};
++  std::atomic<bool> poisoned_{false};
++  std::atomic<int64_t> last_save_monotonic_ms_{0};
++};
++
++// --- Process-wide accessors used by the VulkanPipelineCache hooks ----------
++
++// No-op if the native persistent pipeline cache cvar is disabled or this was
++// already initialized (there is exactly one VulkanPipelineCache per process).
++void InitializePersistentPipelineCache(VkPhysicalDevice physical_device, VkDevice device,
++                                       const std::filesystem::path& blob_path);
++
++// Returns the process-wide pool, or nullptr when disabled/uninitialized.
++PersistentPipelineCache* GetPersistentPipelineCache();
++
++// Periodic save hook (called per submission from the GPU thread): saves when
++// dirty and at least the configured interval has elapsed. Cheap when clean.
++void MaybeSavePersistentPipelineCachePeriodic();
++
++// Save + teardown with the VkDevice still alive. Called from
++// VulkanPipelineCache::Shutdown after creation threads are joined.
++void ShutdownPersistentPipelineCache();
++
++}  // namespace rex::graphics::vulkan::native
++
++#endif  // REX_GRAPHICS_NATIVE_NATIVE_PIPELINE_CACHE_H_
+diff -ruN a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt	2026-09-04 14:28:08.750696578 +0000
++++ b/src/graphics/CMakeLists.txt	2026-09-04 14:06:54.494544574 +0000
+@@ -158,3 +158,73 @@
+         dxguid
+     )
+ endif()
++
++# rexgpu-native: ARM Android-first GPU plugin (hells-gate-recomp-android).
++# Compiles the same guest-facing Xenos emulation core as rexgpu-xenos (PM4
++# command processing, register files, ucode translation - the correctness
++# backbone) with the host-side rendering path re-tuned for mobile via
++# REXGPU_NATIVE compile-time switches:
++#   - persistent driver-level VkPipelineCache across runs
++#     (native/native_pipeline_cache.cpp) - removes the per-run driver
++#     pipeline recompilation storm that dominates frame time on
++#     big.LITTLE SoCs (measured 100-250 ms per pipeline on a Cortex-A73);
++#   - BCn textures kept compressed when the driver can sample them
++#     (nearest filtering instead of the 4x memory/upload decompress
++#     fallback).
++# Loaded with --gpu_plugin=native. Never linked by consumers; staged next to
++# the executable / into the APK like rexgpu-xenos.
++if(REXGLUE_USE_VULKAN)
++    set(REXGPU_NATIVE_EXTRA_SOURCES
++        native/native_pipeline_cache.cpp
++        native/plugin_main_native.cpp
++    )
++    add_library(rexgpu-native SHARED ${REXGPU_XENOS_SOURCES} ${REXGPU_NATIVE_EXTRA_SOURCES})
++    add_library(rex::gpu-native ALIAS rexgpu-native)
++
++    set_target_properties(rexgpu-native PROPERTIES
++        EXPORT_NAME gpu-native
++        CXX_VISIBILITY_PRESET hidden
++        VISIBILITY_INLINES_HIDDEN ON
++    )
++
++    target_compile_definitions(rexgpu-native PRIVATE REXGPU_NATIVE=1)
++
++    target_include_directories(rexgpu-native PRIVATE
++        ${REXGLUE_ROOT}/thirdparty/renderdoc
++        ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
++    )
++
++    target_compile_options(rexgpu-native PRIVATE -Wno-unused-variable)
++
++    rex_target_pch(rexgpu-native
++        <mutex>
++        <unordered_map>
++        <rex/math.h>
++        <rex/memory.h>
++        <rex/thread/mutex.h>
++        <rex/system/xmemory.h>
++        <rex/graphics/xenos.h>
++        <rex/graphics/registers.h>
++        <rex/graphics/format/ucode.h>
++        <rex/graphics/pipeline/shader/shader.h>
++    )
++
++    # Everything PRIVATE: the plugin has no consumers. Never link the OBJECT
++    # libraries (rexcore/rexui) here; rexruntime already contains those
++    # objects and relinking them would duplicate global state.
++    target_link_libraries(rexgpu-native PRIVATE
++        rexruntime
++        xxHash::xxhash
++    )
++
++    target_link_libraries(rexgpu-native PRIVATE
++        Vulkan::Headers
++        glslang::SPIRV
++        GPUOpen::VulkanMemoryAllocator
++        glslang
++        MachineIndependent
++        GenericCodeGen
++        OSDependent
++        OGLCompiler
++    )
++endif()
+diff -ruN a/src/graphics/native/native_pipeline_cache.cpp b/src/graphics/native/native_pipeline_cache.cpp
+--- a/src/graphics/native/native_pipeline_cache.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/graphics/native/native_pipeline_cache.cpp	2026-09-04 14:15:12.365762053 +0000
+@@ -0,0 +1,403 @@
++/**
++ * @file        graphics/native/native_pipeline_cache.cpp
++ * @brief       Persistent driver-level Vulkan pipeline cache implementation.
++ *
++ * @copyright   Copyright (c) 2026 hells-gate-recomp-android contributors
++ * @license     BSD 3-Clause License
++ */
++
++#include <rex/graphics/native/native_pipeline_cache.h>
++
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <vector>
++
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
++
++#if REXGPU_NATIVE
++
++namespace rex::graphics::vulkan::native {
++
++namespace {
++
++REXCVAR_DEFINE_BOOL(native_persistent_pipeline_cache, true, "GPU/Native",
++                    "Persist the driver-level Vulkan pipeline cache to disk between runs "
++                    "(rexgpu-native ARM renderer)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_INT32(native_pipeline_cache_max_mb, 48, "GPU/Native",
++                     "Maximum size of the persisted driver pipeline cache blob (MB)")
++    .range(4, 256)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_INT32(native_pipeline_cache_save_interval_s, 30, "GPU/Native",
++                     "Interval between periodic pipeline cache saves while the game is "
++                     "creating new pipelines (seconds, 0 disables periodic saves)")
++    .range(0, 600)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// On-disk blob layout:
++//   [BlobHeader][VkPipelineCacheData as returned by vkGetPipelineCacheData]
++// The header carries the physical device's pipelineCacheUUID: the driver
++// guarantees the UUID changes whenever the cache format (or driver) changes,
++// which is exactly the invalidation key required here.
++struct BlobHeader {
++  uint32_t magic;             // 'RVPC'
++  uint32_t version;           // kBlobVersion
++  uint32_t header_size;       // sizeof(BlobHeader) - guards future edits
++  uint32_t blob_size;         // payload bytes following the header
++  uint8_t pipeline_cache_uuid[VK_UUID_SIZE];
++  uint32_t vendor_id;
++  uint32_t device_id;
++  uint32_t driver_version;
++  uint32_t api_version;
++};
++static_assert(sizeof(BlobHeader) == 48, "BlobHeader layout is part of the format");
++
++constexpr uint32_t kBlobMagic = 0x52564843u;  // 'RVPC' (little-endian on disk)
++constexpr uint32_t kBlobVersion = 1;
++
++int64_t NowMonotonicMs() {
++  return int64_t(
++      std::chrono::duration_cast<std::chrono::milliseconds>(
++          std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++// Device-level entry points, resolved once per VkDevice (the pool outlives
++// everything but the device; resolved per instance to stay self-contained -
++// no dependency on the SDK's dispatch tables from this TU).
++struct DeviceFunctions {
++  PFN_vkCreatePipelineCache create_pipeline_cache = nullptr;
++  PFN_vkDestroyPipelineCache destroy_pipeline_cache = nullptr;
++  PFN_vkMergePipelineCaches merge_pipeline_caches = nullptr;
++  PFN_vkGetPipelineCacheData get_pipeline_cache_data = nullptr;
++
++  explicit DeviceFunctions(VkDevice device) {
++    auto get = [device](const char* name) { return vkGetDeviceProcAddr(device, name); };
++    create_pipeline_cache =
++        reinterpret_cast<PFN_vkCreatePipelineCache>(get("vkCreatePipelineCache"));
++    destroy_pipeline_cache =
++        reinterpret_cast<PFN_vkDestroyPipelineCache>(get("vkDestroyPipelineCache"));
++    merge_pipeline_caches = reinterpret_cast<PFN_vkMergePipelineCaches>(get("vkMergePipelineCaches"));
++    get_pipeline_cache_data =
++        reinterpret_cast<PFN_vkGetPipelineCacheData>(get("vkGetPipelineCacheData"));
++  }
++};
++
++PersistentPipelineCache* g_persistent_pipeline_cache = nullptr;
++
++}  // namespace
++
++PersistentPipelineCache::~PersistentPipelineCache() {
++  // Deliberately does NOT issue Vulkan calls: the destructor may run after
++  // the VkDevice is gone (hard process exit). Liveness-critical saves happen
++  // through ShutdownPersistentPipelineCache() (graceful path, device alive)
++  // and the periodic save hook (bounds data loss on hard exits).
++  DestroyShards();
++  if (g_persistent_pipeline_cache == this) {
++    g_persistent_pipeline_cache = nullptr;
++  }
++}
++
++void PersistentPipelineCache::Initialize(VkPhysicalDevice physical_device, VkDevice device,
++                                         const std::filesystem::path& blob_path) {
++  if (device_ != VK_NULL_HANDLE) {
++    return;
++  }
++  physical_device_ = physical_device;
++  device_ = device;
++  blob_path_ = blob_path;
++  max_blob_bytes_ = uint64_t(REXCVAR_GET(native_pipeline_cache_max_mb)) * 1024ull * 1024ull;
++
++  VkPhysicalDeviceProperties properties;
++  vkGetPhysicalDeviceProperties(physical_device_, &properties);
++  const DeviceFunctions dfn(device_);
++
++  // Read + validate the previous run's blob (if any).
++  std::vector<uint8_t> seed;
++  std::ifstream blob(blob_path_, std::ios::binary);
++  if (blob) {
++    BlobHeader header{};
++    if (blob.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
++        header.magic == kBlobMagic && header.version == kBlobVersion &&
++        header.header_size == sizeof(BlobHeader) &&
++        std::memcmp(header.pipeline_cache_uuid, properties.pipelineCacheUUID, VK_UUID_SIZE) == 0 &&
++        header.blob_size > 0 && header.blob_size <= max_blob_bytes_) {
++      seed.resize(header.blob_size);
++      if (!blob.read(reinterpret_cast<char*>(seed.data()), std::streamsize(seed.size()))) {
++        seed.clear();
++      }
++    }
++    blob.close();
++  }
++
++  shards_ = std::make_unique<Shard[]>(kShardCount);
++  uint32_t created = 0;
++  for (uint32_t i = 0; i < kShardCount; ++i) {
++    VkPipelineCacheCreateInfo create_info{};
++    create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++    create_info.initialDataSize = seed.size();
++    create_info.pInitialData = seed.empty() ? nullptr : seed.data();
++    if (dfn.create_pipeline_cache &&
++        dfn.create_pipeline_cache(device_, &create_info, nullptr, &shards_[i].cache) ==
++            VK_SUCCESS) {
++      ++created;
++    } else {
++      shards_[i].cache = VK_NULL_HANDLE;
++    }
++  }
++  last_save_monotonic_ms_.store(NowMonotonicMs(), std::memory_order_relaxed);
++  dirty_.store(false, std::memory_order_release);
++  poisoned_.store(false, std::memory_order_release);
++
++  REXGPU_INFO(
++      "NativePipelineCache: {} persistent VkPipelineCache shards created at {} (seed {} bytes, "
++      "uuid {:02x}{:02x}{:02x}{:02x}..., max {} MB)",
++      created, rex::path_to_utf8(blob_path_), seed.size(), properties.pipelineCacheUUID[0],
++      properties.pipelineCacheUUID[1], properties.pipelineCacheUUID[2],
++      properties.pipelineCacheUUID[3], REXCVAR_GET(native_pipeline_cache_max_mb));
++
++  if (created == 0) {
++    // Nothing usable - disable silently (the plugin keeps working without it).
++    DestroyShards();
++    device_ = VK_NULL_HANDLE;
++    return;
++  }
++  g_persistent_pipeline_cache = this;
++}
++
++PersistentPipelineCache::CreationSlot PersistentPipelineCache::BeginCreation() {
++  if (device_ == VK_NULL_HANDLE) {
++    return {};
++  }
++  const uint32_t shard = next_shard_.fetch_add(1, std::memory_order_relaxed) % kShardCount;
++  VkPipelineCache cache = shards_[shard].cache;
++  if (cache == VK_NULL_HANDLE) {
++    return {};
++  }
++  return CreationSlot(this, shard, cache, std::unique_lock<std::mutex>(shards_[shard].mutex));
++}
++
++void PersistentPipelineCache::CreationSlot::Release() {
++  if (lock_.owns_lock()) {
++    lock_.unlock();
++  }
++  cache_ = nullptr;
++  cache_handle_ = VK_NULL_HANDLE;
++}
++
++void PersistentPipelineCache::CreationSlot::MarkDirty() {
++  if (cache_) {
++    cache_->dirty_.store(true, std::memory_order_release);
++  }
++}
++
++void PersistentPipelineCache::CreationSlot::Poison() {
++  if (cache_) {
++    cache_->poisoned_.store(true, std::memory_order_release);
++  }
++}
++
++void PersistentPipelineCache::Save(bool wait_for_busy) {
++  if (device_ == VK_NULL_HANDLE || !shards_) {
++    return;
++  }
++  if (!wait_for_busy && !dirty_.load(std::memory_order_acquire)) {
++    return;
++  }
++  if (poisoned_.load(std::memory_order_acquire)) {
++    // The driver rejected cache-backed creation earlier this run; drop the
++    // blob instead of persisting data it cannot consume.
++    std::error_code ec;
++    std::filesystem::remove(blob_path_, ec);
++    dirty_.store(false, std::memory_order_release);
++    REXGPU_WARN("NativePipelineCache: cache poisoned this run, blob removed");
++    return;
++  }
++
++  const DeviceFunctions dfn(device_);
++
++  // Merge every unlocked shard into shard 0. Busy shards are skipped (unless
++  // shutting down, where all creation threads are already joined) - their
++  // pipelines are picked up by a later save.
++  std::vector<VkPipelineCache> mergeable;
++  mergeable.reserve(kShardCount);
++  for (uint32_t i = 1; i < kShardCount; ++i) {
++    if (shards_[i].cache == VK_NULL_HANDLE) {
++      continue;
++    }
++    std::unique_lock<std::mutex> lock(shards_[i].mutex, std::try_to_lock);
++    if (wait_for_busy && !lock.owns_lock()) {
++      lock.lock();
++    }
++    if (lock.owns_lock() && shards_[i].cache != VK_NULL_HANDLE) {
++      mergeable.push_back(shards_[i].cache);
++    }
++  }
++  if (!mergeable.empty() && shards_[0].cache != VK_NULL_HANDLE) {
++    std::lock_guard<std::mutex> lock0(shards_[0].mutex);
++    if (!dfn.merge_pipeline_caches ||
++        dfn.merge_pipeline_caches(device_, shards_[0].cache, uint32_t(mergeable.size()),
++                                  mergeable.data()) != VK_SUCCESS) {
++      REXGPU_WARN("NativePipelineCache: vkMergePipelineCaches failed, saving shard 0 only");
++    }
++  }
++  if (shards_[0].cache == VK_NULL_HANDLE) {
++    return;
++  }
++
++  // Retrieve shard 0's data (locked; the GPU thread / shutdown path is the
++  // only caller, and creation workers never target shard 0 for long because
++  // of the round-robin).
++  std::vector<uint8_t> data;
++  {
++    std::lock_guard<std::mutex> lock0(shards_[0].mutex);
++    if (!dfn.get_pipeline_cache_data) {
++      return;
++    }
++    size_t data_size = 0;
++    if (dfn.get_pipeline_cache_data(device_, shards_[0].cache, &data_size, nullptr) != VK_SUCCESS ||
++        data_size == 0) {
++      return;
++    }
++    if (data_size > max_blob_bytes_) {
++      // A truncated blob would be rejected by the driver as corrupt - skip
++      // the save instead and keep the previous (smaller) blob on disk.
++      REXGPU_WARN(
++          "NativePipelineCache: cache data {} bytes exceeds the {} MB cap, skipping the save "
++          "(raise native_pipeline_cache_max_mb if this persists)",
++          data_size, REXCVAR_GET(native_pipeline_cache_max_mb));
++      last_save_monotonic_ms_.store(NowMonotonicMs(), std::memory_order_relaxed);
++      return;
++    }
++    data.resize(data_size);
++    if (dfn.get_pipeline_cache_data(device_, shards_[0].cache, &data_size, data.data()) !=
++            VK_SUCCESS ||
++        data_size == 0) {
++      return;
++    }
++    data.resize(data_size);
++  }
++
++  // Atomic-ish write: tmp file + rename, so a crash mid-write never
++  // corrupts the previous run's cache.
++  const std::filesystem::path tmp_path = blob_path_.string() + ".tmp";
++  {
++    std::error_code ec;
++    std::filesystem::create_directories(blob_path_.parent_path(), ec);
++    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
++    if (!out) {
++      REXGPU_WARN("NativePipelineCache: failed to open {} for writing",
++                  rex::path_to_utf8(tmp_path));
++      return;
++    }
++    VkPhysicalDeviceProperties properties;
++    vkGetPhysicalDeviceProperties(physical_device_, &properties);
++    BlobHeader header{};
++    header.magic = kBlobMagic;
++    header.version = kBlobVersion;
++    header.header_size = sizeof(BlobHeader);
++    header.blob_size = uint32_t(data.size());
++    std::memcpy(header.pipeline_cache_uuid, properties.pipelineCacheUUID, VK_UUID_SIZE);
++    header.vendor_id = properties.vendorID;
++    header.device_id = properties.deviceID;
++    header.driver_version = properties.driverVersion;
++    header.api_version = properties.apiVersion;
++    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
++    if (!data.empty()) {
++      out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
++    }
++    out.close();
++    if (!out) {
++      std::filesystem::remove(tmp_path, ec);
++      REXGPU_WARN("NativePipelineCache: failed to write the pipeline cache blob");
++      return;
++    }
++    std::filesystem::rename(tmp_path, blob_path_, ec);
++    if (ec) {
++      std::filesystem::remove(tmp_path, ec);
++      REXGPU_WARN("NativePipelineCache: failed to commit the pipeline cache blob");
++      return;
++    }
++  }
++
++  dirty_.store(false, std::memory_order_release);
++  last_save_monotonic_ms_.store(NowMonotonicMs(), std::memory_order_relaxed);
++  REXGPU_INFO("NativePipelineCache: saved {} bytes to {}", data.size(),
++              rex::path_to_utf8(blob_path_));
++}
++
++void PersistentPipelineCache::DestroyShards() {
++  if (device_ != VK_NULL_HANDLE && shards_) {
++    const DeviceFunctions dfn(device_);
++    for (uint32_t i = 0; i < kShardCount; ++i) {
++      if (shards_[i].cache != VK_NULL_HANDLE && dfn.destroy_pipeline_cache) {
++        dfn.destroy_pipeline_cache(device_, shards_[i].cache, nullptr);
++        shards_[i].cache = VK_NULL_HANDLE;
++      }
++    }
++  }
++  shards_.reset();
++}
++
++void PersistentPipelineCache::Shutdown() {
++  if (device_ == VK_NULL_HANDLE) {
++    return;
++  }
++  Save(true);
++  DestroyShards();
++  device_ = VK_NULL_HANDLE;
++  if (g_persistent_pipeline_cache == this) {
++    g_persistent_pipeline_cache = nullptr;
++  }
++}
++
++// --- Process-wide accessors -------------------------------------------------
++
++void InitializePersistentPipelineCache(VkPhysicalDevice physical_device, VkDevice device,
++                                       const std::filesystem::path& blob_path) {
++  if (!REXCVAR_GET(native_persistent_pipeline_cache)) {
++    REXGPU_INFO("NativePipelineCache: disabled by cvar");
++    return;
++  }
++  static PersistentPipelineCache pool;
++  pool.Initialize(physical_device, device, blob_path);
++}
++
++PersistentPipelineCache* GetPersistentPipelineCache() { return g_persistent_pipeline_cache; }
++
++void PersistentPipelineCache::MaybeSavePeriodic() {
++  const int32_t interval_s = REXCVAR_GET(native_pipeline_cache_save_interval_s);
++  if (interval_s <= 0 || !dirty_.load(std::memory_order_acquire)) {
++    return;
++  }
++  const int64_t now_ms = NowMonotonicMs();
++  const int64_t last_ms = last_save_monotonic_ms_.load(std::memory_order_relaxed);
++  if (now_ms - last_ms < int64_t(interval_s) * 1000) {
++    return;
++  }
++  Save(false);
++}
++
++void MaybeSavePersistentPipelineCachePeriodic() {
++  PersistentPipelineCache* cache = g_persistent_pipeline_cache;
++  if (cache) {
++    cache->MaybeSavePeriodic();
++  }
++}
++
++void ShutdownPersistentPipelineCache() {
++  PersistentPipelineCache* cache = g_persistent_pipeline_cache;
++  if (cache) {
++    cache->Shutdown();
++  }
++}
++
++}  // namespace rex::graphics::vulkan::native
++
++#endif  // REXGPU_NATIVE
+diff -ruN a/src/graphics/native/plugin_main_native.cpp b/src/graphics/native/plugin_main_native.cpp
+--- a/src/graphics/native/plugin_main_native.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/graphics/native/plugin_main_native.cpp	2026-09-04 14:01:09.905708241 +0000
+@@ -0,0 +1,57 @@
++/**
++ * @file        graphics/native/plugin_main_native.cpp
++ * @brief       rexgpu-native plugin entry points (ARM Android renderer)
++ *
++ * @remarks     rexgpu-native packages the same guest-facing Xenos emulation
++ *              core as rexgpu-xenos (PM4 command processing, register files,
++ *              ucode translation - the correctness backbone any Xenos
++ *              renderer needs) with a host-side rendering architecture
++ *              re-tuned for ARM Android:
++ *                - persistent driver-level VkPipelineCache across runs
++ *                  (native_pipeline_cache.cpp), removing the per-run driver
++ *                  pipeline recompilation storm;
++ *                - BCn texture formats kept in their compressed form when the
++ *                  driver can sample them (nearest filtering instead of the
++ *                  4x memory/upload decompress fallback).
++ *              Selected with --gpu_plugin=native (Android UI toggle).
++ *
++ * @copyright   Copyright (c) 2026 hells-gate-recomp-android contributors
++ * @license     BSD 3-Clause License
++ */
++
++#include <string_view>
++
++#include <rex/logging.h>
++#include <rex/system/gpu_plugin.h>
++
++#if REX_HAS_VULKAN
++#include <rex/graphics/vulkan/graphics_system.h>
++#endif
++
++extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
++  return rex::system::kGpuPluginAbiVersion;
++}
++
++extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
++    uint32_t abi_version, const rex::system::GpuCreateInfo* info) {
++  if (abi_version != rex::system::kGpuPluginAbiVersion) {
++    REXLOG_ERROR("rexgpu-native: host requested ABI {}, plugin is ABI {}", abi_version,
++                 rex::system::kGpuPluginAbiVersion);
++    return nullptr;
++  }
++  if (!info || info->struct_size < sizeof(rex::system::GpuCreateInfo)) {
++    REXLOG_ERROR("rexgpu-native: invalid GpuCreateInfo");
++    return nullptr;
++  }
++
++  std::string_view backend = info->backend ? info->backend : "any";
++#if REX_HAS_VULKAN
++  if (backend == "any" || backend == "vulkan") {
++    REXLOG_INFO("rexgpu-native: ARM-native Vulkan renderer enabled "
++                "(persistent driver pipeline cache + BCn-preserving texture policy)");
++    return new rex::graphics::vulkan::VulkanGraphicsSystem();
++  }
++#endif
++  REXLOG_ERROR("rexgpu-native: requested backend '{}' is not compiled into this plugin", backend);
++  return nullptr;
++}
+diff -ruN a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+--- a/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:28:08.794696684 +0000
++++ b/src/graphics/vulkan/pipeline_cache.cpp	2026-09-04 14:06:18.302458396 +0000
+@@ -49,6 +49,10 @@
+ #include <rex/types.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++#if REXGPU_NATIVE
++#include <rex/graphics/native/native_pipeline_cache.h>
++#endif  // REXGPU_NATIVE
++
+ REXCVAR_DEFINE_INT32(
+     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
+     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
+@@ -396,6 +400,23 @@
+     startup_loading_ = false;
+   }
+ 
++#if REXGPU_NATIVE
++  // ARM-native renderer: bring up the persistent driver-level pipeline cache
++  // for this title BEFORE the storage-backed startup prewarm below, so the
++  // prewarm (and every later creation) resolves previously compiled pipeline
++  // binaries from the driver cache instead of recompiling them from scratch
++  // on every run (the dominant warmup cost on mobile SoCs).
++  {
++    const ui::vulkan::VulkanDevice* const native_vulkan_device =
++        command_processor_.GetVulkanDevice();
++    if (native_vulkan_device) {
++      native::InitializePersistentPipelineCache(
++          native_vulkan_device->physical_device(), native_vulkan_device->device(),
++          cache_root / "pipelines" / fmt::format("{:08X}", title_id) / "vkcache.bin");
++    }
++  }
++#endif  // REXGPU_NATIVE
++
+   auto shader_storage_root = cache_root / "shaders";
+   auto shader_storage_shareable_root = shader_storage_root / "shareable";
+   if (!std::filesystem::exists(shader_storage_shareable_root)) {
+@@ -744,6 +765,12 @@
+ }
+ 
+ void VulkanPipelineCache::EndSubmission() {
++#if REXGPU_NATIVE
++  // ARM-native renderer: periodic save of the persistent driver pipeline
++  // cache (no-op unless dirty and the interval has elapsed; never blocks on
++  // shards a worker is currently compiling for).
++  native::MaybeSavePersistentPipelineCachePeriodic();
++#endif  // REXGPU_NATIVE
+   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
+     {
+       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+@@ -818,6 +845,12 @@
+ 
+   ShutdownShaderStorage();
+ 
++#if REXGPU_NATIVE
++  // ARM-native renderer: all creation threads are joined at this point and
++  // the device is still alive - the last, complete save of the run.
++  native::ShutdownPersistentPipelineCache();
++#endif  // REXGPU_NATIVE
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -3480,8 +3513,29 @@
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++#if REXGPU_NATIVE
++  // ARM-native renderer: create through the persistent driver pipeline cache
++  // (sharded, so concurrent creation threads don't serialize). If the driver
++  // rejects cache-backed creation (corrupt/foreign blob), poison the
++  // persisted blob and fall back to a cache-less compile for this pipeline.
++  native::PersistentPipelineCache* native_cache = native::GetPersistentPipelineCache();
++  native::PersistentPipelineCache::CreationSlot native_cache_slot =
++      native_cache ? native_cache->BeginCreation() : native::PersistentPipelineCache::CreationSlot();
++  VkResult create_result =
++      dfn.vkCreateGraphicsPipelines(device, native_cache_slot.cache(), 1, &pipeline_create_info,
++                                    nullptr, &pipeline);
++  if (create_result != VK_SUCCESS && native_cache_slot) {
++    native_cache_slot.Poison();
++    native_cache_slot = native::PersistentPipelineCache::CreationSlot();
++    create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info,
++                                                  nullptr, &pipeline);
++  } else if (create_result == VK_SUCCESS && native_cache_slot) {
++    native_cache_slot.MarkDirty();
++  }
++#else
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++#endif  // REXGPU_NATIVE
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff -ruN a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+--- a/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:28:09.244697767 +0000
++++ b/src/graphics/vulkan/texture_cache.cpp	2026-09-04 14:05:52.042396774 +0000
+@@ -35,6 +35,19 @@
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+ 
++#if REXGPU_NATIVE
++// rexgpu-native (ARM renderer) texture policy: keep BCn textures compressed
++// when the driver can sample them at all (nearest filtering replaces linear
++// when the driver lacks the filter bit for the format), avoiding the 4x
++// texture memory / upload bandwidth decompress fallback. See the S3TC section
++// of VulkanTextureCache::Initialize.
++REXCVAR_DEFINE_BOOL(native_bcn_textures, true, "GPU/Native",
++                    "Keep BCn textures in their compressed form when the driver can sample "
++                    "them (rexgpu-native ARM renderer); sampling falls back to nearest when "
++                    "linear filtering is unavailable")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++#endif  // REXGPU_NATIVE
++
+ namespace rex::graphics::vulkan {
+ 
+ // Generated with `xb buildshaders`.
+@@ -2462,6 +2475,41 @@
+   // decompressed.
+   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
+   // TODO(Triang3l): S3TC -> ETC2 / EAC (a huge research topic).
++#if REXGPU_NATIVE
++  // ARM-native renderer: returns the BCn format to KEEP (block-compressed)
++  // for a guest texture whose UNORM host format lacks linear filtering, or
++  // VK_FORMAT_UNDEFINED when the decompress fallback must run. Keeping BCn
++  // avoids the 4x texture memory / upload bandwidth blowup of decompressing
++  // to RGBA8 - sampling switches to nearest via the generic
++  // linear_filterable derivation in the normalization pass below (or keeps
++  // linear when the UNORM format actually has it on a different driver).
++  auto native_keep_bcn_format = [&](VkFormatFeatureFlags optimal_tiling_features,
++                                    VkFormat unorm_format, VkFormat srgb_format,
++                                    bool allow_srgb) -> VkFormat {
++    if (!REXCVAR_GET(native_bcn_textures)) {
++      return VK_FORMAT_UNDEFINED;
++    }
++    if (optimal_tiling_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
++      return unorm_format;
++    }
++    if (allow_srgb && srgb_format != VK_FORMAT_UNDEFINED) {
++      // Some mobile drivers (Adreno 6xx among them) expose BCn only through
++      // the SRGB variants. For color textures that is acceptable (hardware
++      // sRGB decode; often more correct for albedo data anyway); data
++      // formats (BC4/BC5) pass allow_srgb=false.
++      VkFormatProperties srgb_properties;
++      ifn.vkGetPhysicalDeviceFormatProperties(physical_device, srgb_format, &srgb_properties);
++      if (srgb_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
++        REXGPU_WARN(
++            "NativeTextureCache: BCn format {} UNORM is not sampleable on this driver, "
++            "keeping the SRGB variant {} compressed",
++            uint32_t(unorm_format), uint32_t(srgb_format));
++        return srgb_format;
++      }
++    }
++    return VK_FORMAT_UNDEFINED;
++  };
++#endif  // REXGPU_NATIVE
+   // One-shot diagnostic for BC fallbacks: decompressing BC textures to RGBA8
+   // multiplies texture memory and re-upload bandwidth 4x (and adds a compute
+   // decode pass on every invalidation). On mobile this alone can dominate
+@@ -2482,58 +2530,117 @@
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                                           &format_properties);
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+-    log_bc_fallback("k_DXT1", VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+-                    format_properties.optimalTilingFeatures);
+-    host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
+-    host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+-    host_format_dxt1.format_unsigned.block_compressed = false;
+-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
++#if REXGPU_NATIVE
++    const VkFormat native_dxt1_format =
++        native_keep_bcn_format(format_properties.optimalTilingFeatures,
++                               VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
++                               true);
++    if (native_dxt1_format != VK_FORMAT_UNDEFINED) {
++      host_format_dxt1.format_unsigned.format = native_dxt1_format;
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
++    } else
++#endif  // REXGPU_NATIVE
++    {
++      log_bc_fallback("k_DXT1", VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
++                      format_properties.optimalTilingFeatures);
++      host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
++      host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
++      host_format_dxt1.format_unsigned.block_compressed = false;
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
++    }
+   }
+   HostFormatPair& host_format_dxt2_3 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3)];
+   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC2_UNORM_BLOCK,
+                                           &format_properties);
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+-    log_bc_fallback("k_DXT2_3", VK_FORMAT_BC2_UNORM_BLOCK,
+-                    format_properties.optimalTilingFeatures);
+-    host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
+-    host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+-    host_format_dxt2_3.format_unsigned.block_compressed = false;
+-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
++#if REXGPU_NATIVE
++    const VkFormat native_dxt2_3_format =
++        native_keep_bcn_format(format_properties.optimalTilingFeatures,
++                               VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK, true);
++    if (native_dxt2_3_format != VK_FORMAT_UNDEFINED) {
++      host_format_dxt2_3.format_unsigned.format = native_dxt2_3_format;
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
++    } else
++#endif  // REXGPU_NATIVE
++    {
++      log_bc_fallback("k_DXT2_3", VK_FORMAT_BC2_UNORM_BLOCK,
++                      format_properties.optimalTilingFeatures);
++      host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
++      host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
++      host_format_dxt2_3.format_unsigned.block_compressed = false;
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
++    }
+   }
+   HostFormatPair& host_format_dxt4_5 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5)];
+   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC3_UNORM_BLOCK,
+                                           &format_properties);
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+-    log_bc_fallback("k_DXT4_5", VK_FORMAT_BC3_UNORM_BLOCK,
+-                    format_properties.optimalTilingFeatures);
+-    host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
+-    host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+-    host_format_dxt4_5.format_unsigned.block_compressed = false;
+-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
++#if REXGPU_NATIVE
++    const VkFormat native_dxt4_5_format =
++        native_keep_bcn_format(format_properties.optimalTilingFeatures,
++                               VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK, true);
++    if (native_dxt4_5_format != VK_FORMAT_UNDEFINED) {
++      host_format_dxt4_5.format_unsigned.format = native_dxt4_5_format;
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
++    } else
++#endif  // REXGPU_NATIVE
++    {
++      log_bc_fallback("k_DXT4_5", VK_FORMAT_BC3_UNORM_BLOCK,
++                      format_properties.optimalTilingFeatures);
++      host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
++      host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
++      host_format_dxt4_5.format_unsigned.block_compressed = false;
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
++    }
+   }
+   HostFormatPair& host_format_dxn = host_formats_[uint32_t(xenos::TextureFormat::k_DXN)];
+   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC5_UNORM_BLOCK,
+                                           &format_properties);
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+-    log_bc_fallback("k_DXN", VK_FORMAT_BC5_UNORM_BLOCK,
+-                    format_properties.optimalTilingFeatures);
+-    host_format_dxn.format_unsigned.load_shader = kLoadShaderIndexDXNToRG8;
+-    host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
+-    host_format_dxn.format_unsigned.block_compressed = false;
++#if REXGPU_NATIVE
++    // DXN (BC5) is a two-channel DATA format (normals/height): the sRGB
++    // variant must not be substituted (hardware sRGB decode would corrupt
++    // the data), so only the UNORM path keeps it compressed.
++    const VkFormat native_dxn_format = native_keep_bcn_format(
++        format_properties.optimalTilingFeatures, VK_FORMAT_BC5_UNORM_BLOCK,
++        VK_FORMAT_UNDEFINED, false);
++    if (native_dxn_format != VK_FORMAT_UNDEFINED) {
++      host_format_dxn.format_unsigned.format = native_dxn_format;
++    } else
++#endif  // REXGPU_NATIVE
++    {
++      log_bc_fallback("k_DXN", VK_FORMAT_BC5_UNORM_BLOCK,
++                      format_properties.optimalTilingFeatures);
++      host_format_dxn.format_unsigned.load_shader = kLoadShaderIndexDXNToRG8;
++      host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
++      host_format_dxn.format_unsigned.block_compressed = false;
++    }
+   }
+   HostFormatPair& host_format_dxt5a = host_formats_[uint32_t(xenos::TextureFormat::k_DXT5A)];
+   assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
+                                           &format_properties);
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+-    log_bc_fallback("k_DXT5A", VK_FORMAT_BC4_UNORM_BLOCK,
+-                    format_properties.optimalTilingFeatures);
+-    host_format_dxt5a.format_unsigned.load_shader = kLoadShaderIndexDXT5AToR8;
+-    host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
+-    host_format_dxt5a.format_unsigned.block_compressed = false;
++#if REXGPU_NATIVE
++    // DXT5A (BC4) is a single-channel DATA format: UNORM-only, same rationale
++    // as DXN above.
++    const VkFormat native_dxt5a_format = native_keep_bcn_format(
++        format_properties.optimalTilingFeatures, VK_FORMAT_BC4_UNORM_BLOCK,
++        VK_FORMAT_UNDEFINED, false);
++    if (native_dxt5a_format != VK_FORMAT_UNDEFINED) {
++      host_format_dxt5a.format_unsigned.format = native_dxt5a_format;
++    } else
++#endif  // REXGPU_NATIVE
++    {
++      log_bc_fallback("k_DXT5A", VK_FORMAT_BC4_UNORM_BLOCK,
++                      format_properties.optimalTilingFeatures);
++      host_format_dxt5a.format_unsigned.load_shader = kLoadShaderIndexDXT5AToR8;
++      host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
++      host_format_dxt5a.format_unsigned.block_compressed = false;
++    }
+   }
+   // Keep signed format support aligned with D3D12 for texture formats where
+   // D3D12 doesn't expose signed sampling paths.

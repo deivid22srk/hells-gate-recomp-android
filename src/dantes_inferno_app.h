@@ -23,6 +23,11 @@
 REXCVAR_DEFINE_DOUBLE(time_scalar, 1.0, "Gameplay",
                       "Guest time scaling factor (1.0 = normal, 50.0 = fast-forward)");
 
+// Defined in the SDK (src/ui/rex_app.cpp, compiled into this same library):
+// explicit GPU plugin selection from the command line (the Android renderer
+// toggle passes --gpu_plugin=native when the native renderer is enabled).
+REXCVAR_DECLARE(std::string, gpu_plugin);
+
 // Toggle for the FPS overlay.
 REXCVAR_DEFINE_BOOL(show_fps_overlay, false, "UI",
                     "Show FPS and frametime overlay (top-left corner)");
@@ -143,10 +148,16 @@ class DantesInfernoApp : public rex::ReXApp {
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
     // --- GPU plugin ---
-    // Load the Xenos GPU emulation plugin (built as rexgpu-xenos.dll).
-    // Without this, all Vd* graphics calls are no-ops and the game can't
-    // render anything.
-    config.gpu_plugin = "xenos";
+    // Default: the stock Xenos GPU emulation plugin (librexgpu-xenos.so).
+    // An explicit --gpu_plugin=<name> argument (the Android renderer toggle
+    // writes --gpu_plugin=native from renderer.txt) selects an alternative
+    // plugin shipped in the APK (e.g. librexgpu-native.so, the ARM renderer).
+    // The cvar is parsed before OnPreSetup runs, so an explicit value wins
+    // over the default below. Without a GPU plugin, all Vd* graphics calls
+    // are no-ops and the game can't render anything.
+    const std::string gpu_plugin_cvar = REXCVAR_GET(gpu_plugin);
+    config.gpu_plugin =
+        gpu_plugin_cvar.empty() ? std::string("xenos") : gpu_plugin_cvar;
 
     // --- Render target path ---
     // Use pixel-shader interlock (rasterizer-ordered views) instead of host

@@ -206,6 +206,20 @@ int RunAndroidApp(int argc, char** argv) {
   // debugging GPU/CPU memory coherency issues.
   args.emplace_back("--clear_memory_page_state=false");
 
+  // --- GPU renderer selection (SetupActivity toggle) -----------------------
+  // The Java UI writes "native" or "xenos" into renderer.txt (next to
+  // game_root.txt). "native" loads librexgpu-native.so (ARM renderer:
+  // persistent driver pipeline cache + BCn-preserving texture policy);
+  // anything else keeps the stock librexgpu-xenos.so. The selection is
+  // startup-only: the game must be restarted after changing the toggle.
+  const std::string renderer = ReadTrimmedFile(external_dir + "/renderer.txt");
+  if (renderer == "native") {
+    args.emplace_back("--gpu_plugin=native");
+  }
+  REXLOG_INFO("android_main: gpu renderer = {}",
+              renderer == "native" ? "native (rexgpu-native)"
+                                   : "xenos (stock, default)");
+
   std::vector<char*> argv_ptrs;
   argv_ptrs.reserve(args.size());
   for (auto& arg : args) {
