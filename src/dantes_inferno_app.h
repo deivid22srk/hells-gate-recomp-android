@@ -28,7 +28,10 @@ REXCVAR_DEFINE_DOUBLE(time_scalar, 1.0, "Gameplay",
 // toggle passes --gpu_plugin=native when the native renderer is enabled).
 REXCVAR_DECLARE(std::string, gpu_plugin);
 
-// Toggle for the FPS overlay.
+// Toggle for the FPS overlay. Default ON on this port: mobile hardware makes
+// quantified frametimes essential for performance triage (the overlay shows
+// the guest frame rate + per-frame ms in the top-left corner; disable via the
+// show_fps_overlay config flag or by tapping it off in a future settings UI).
 REXCVAR_DEFINE_BOOL(show_fps_overlay, true, "UI",
                     "Show FPS and frametime overlay (top-left corner)");
 
