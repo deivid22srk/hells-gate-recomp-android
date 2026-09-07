@@ -17,5 +17,5 @@
     <string name="setup_play">Iniciar jogo</string>
     <string name="setup_status_ready">Jogo configurado e pronto.</string>
     <string name="setup_renderer_label">Renderizador nativo (experimental)</string>
-    <string name="setup_renderer_summary">Desligado (recomendado): renderizador original (rexgpu-xenos). Ligado: renderizador nativo ARM (rexgpu-native) — experimental e sabidamente com tela preta neste jogo (a imagem final é montada por um passe de pós-processamento que o frame nativo não reproduz); desative se a tela ficar preta. A mudança vale na próxima vez que o jogo iniciar.</string>
+    <string name="setup_renderer_summary">Desligado: renderizador original (rexgpu-xenos), totalmente emulado. Ligado: renderizador nativo ARM (rexgpu-native) — a cena é desenhada diretamente em Vulkan e a ponte de resolve alimenta o pós-processamento do jogo com os pixels reais (o passe final continua emulado). Se a ponte não funcionar neste aparelho, o renderizador volta sozinho para o modo emulado (sem tela preta). A mudança vale na próxima vez que o jogo iniciar.</string>
 </resources>

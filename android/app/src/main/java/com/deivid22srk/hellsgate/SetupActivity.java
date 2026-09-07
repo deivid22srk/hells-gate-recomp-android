@@ -525,13 +525,14 @@ public class SetupActivity extends Activity {
         }
     }
 
-    /** One-time reset of the renderer selection (v0.1.5). The ARM-native
-     *  renderer presents a black screen on Dante's Inferno: the game's final
-     *  image is composed by a post-processing pass whose inputs (EDRAM
-     *  resolves / render-to-texture chains) the native frame suppresses, so
-     *  the presented frame is black. Everyone who had the toggle on lands
-     *  back on the stock (working) renderer; the switch remains usable for
-     *  experiments and future fixes. */
+    /** One-time reset of the renderer selection (v0.1.5). The first ARM-native
+     *  renderer suppressed the passes the game's final composite samples from
+     *  (EDRAM resolves / render-to-texture chains), so it presented a black
+     *  screen on Dante's Inferno. Everyone who had the toggle on landed back
+     *  on the stock (working) renderer. v0.1.6 replaced that renderer with a
+     *  hybrid design (native scene + EDRAM resolve bridge + emulated post)
+     *  that composes the real image and falls back to the emulated path by
+     *  itself when the bridge cannot run. */
     private static final String PREF_RENDERER_RESET_V15 = "renderer_reset_v15";
 
     private void applyOneTimeRendererReset() {
