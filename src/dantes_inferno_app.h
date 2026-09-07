@@ -23,8 +23,11 @@
 REXCVAR_DEFINE_DOUBLE(time_scalar, 1.0, "Gameplay",
                       "Guest time scaling factor (1.0 = normal, 50.0 = fast-forward)");
 
-// Toggle for the FPS overlay.
-REXCVAR_DEFINE_BOOL(show_fps_overlay, false, "UI",
+// Toggle for the FPS overlay. Default ON on this port: mobile hardware makes
+// quantified frametimes essential for performance triage (the overlay shows
+// the guest frame rate + per-frame ms in the top-left corner; disable via the
+// show_fps_overlay config flag or by tapping it off in a future settings UI).
+REXCVAR_DEFINE_BOOL(show_fps_overlay, true, "UI",
                     "Show FPS and frametime overlay (top-left corner)");
 
 REXCVAR_DEFINE_STRING(glyph_family, "auto", "UI",
