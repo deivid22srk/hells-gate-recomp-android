@@ -29,7 +29,7 @@ REXCVAR_DEFINE_DOUBLE(time_scalar, 1.0, "Gameplay",
 REXCVAR_DECLARE(std::string, gpu_plugin);
 
 // Toggle for the FPS overlay.
-REXCVAR_DEFINE_BOOL(show_fps_overlay, false, "UI",
+REXCVAR_DEFINE_BOOL(show_fps_overlay, true, "UI",
                     "Show FPS and frametime overlay (top-left corner)");
 
 REXCVAR_DEFINE_STRING(glyph_family, "auto", "UI",

@@ -116,6 +116,7 @@ public class SetupActivity extends Activity {
         // Renderer toggle: native (rexgpu-native) vs stock (rexgpu-xenos).
         // Visible always; only consumed by the native side when the game is
         // configured. Persisted immediately on change.
+        applyOneTimeRendererReset();
         rendererSwitch = new Switch(this);
         rendererSwitch.setText(R.string.setup_renderer_label);
         rendererSwitch.setTextSize(14);
@@ -522,6 +523,26 @@ public class SetupActivity extends Activity {
             }
         } catch (Exception ignored) {
         }
+    }
+
+    /** One-time reset of the renderer selection (v0.1.5). The ARM-native
+     *  renderer presents a black screen on Dante's Inferno: the game's final
+     *  image is composed by a post-processing pass whose inputs (EDRAM
+     *  resolves / render-to-texture chains) the native frame suppresses, so
+     *  the presented frame is black. Everyone who had the toggle on lands
+     *  back on the stock (working) renderer; the switch remains usable for
+     *  experiments and future fixes. */
+    private static final String PREF_RENDERER_RESET_V15 = "renderer_reset_v15";
+
+    private void applyOneTimeRendererReset() {
+        if (prefs().getBoolean(PREF_RENDERER_RESET_V15, false)) {
+            return;
+        }
+        if (prefs().contains("native_renderer")
+                && prefs().getBoolean("native_renderer", false)) {
+            persistRenderer(false);
+        }
+        prefs().edit().putBoolean(PREF_RENDERER_RESET_V15, true).apply();
     }
 
     private boolean hasValidConfig() {

@@ -126,10 +126,10 @@ index 9d2a848..b59702a 100644
      uint32_t rect_count;
 diff --git a/include/rex/graphics/vulkan/native_frame_renderer.h b/include/rex/graphics/vulkan/native_frame_renderer.h
 new file mode 100644
-index 0000000..690492e
+index 0000000..f33c203
 --- /dev/null
 +++ b/include/rex/graphics/vulkan/native_frame_renderer.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,187 @@
 +/**
 + * @file        vulkan/native_frame_renderer.h
 + * @brief       ARM-native frame renderer for the Vulkan command processor
@@ -152,12 +152,23 @@ index 0000000..690492e
 + *               - the first main-pass draw clears the native targets, later
 + *                 draws load them (single in-order scene pass);
 + *               - draws outside the main surface (render-to-texture, post
-+ *                 chains, shadow maps at smaller pitches) are suppressed;
++ *                 chains, shadow maps - identified by real surface width,
++ *                 NOT raw EDRAM pitch: at 4x MSAA the 1280-wide main surface
++ *                 has pitch 640, the same value as a 1x 640-wide half-
++ *                 resolution post surface) are suppressed;
 + *               - memexport draws still run on the emulated path for their
 + *                 memory side effects;
 + *               - at swap the native color target is blitted into the
 + *                 presenter's guest output image (the gamma/FXAA chain is
 + *                 skipped; the presenter paints the image directly).
++ *
++ *              Known limitation (why this renderer is opt-in on Dante's
++ *              Inferno): a game whose final image is composed by a swap-
++ *              sized post-processing pass reading textures produced by
++ *              EDRAM resolves / render-to-texture chains gets those inputs
++ *              suppressed here, so the composited output (and therefore the
++ *              presented frame) is black. The native frame is correct for
++ *              titles whose swap-sized pass IS the final image.
 + */
 +
 +#pragma once
@@ -753,10 +764,10 @@ index b49e033..d480d29 100644
          dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
 diff --git a/src/graphics/vulkan/native_frame_renderer.cpp b/src/graphics/vulkan/native_frame_renderer.cpp
 new file mode 100644
-index 0000000..99cfafa
+index 0000000..cb8ca61
 --- /dev/null
 +++ b/src/graphics/vulkan/native_frame_renderer.cpp
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,858 @@
 +/**
 + * @file        vulkan/native_frame_renderer.cpp
 + * @brief       ARM-native frame renderer implementation
@@ -799,11 +810,15 @@ index 0000000..99cfafa
 +    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +
 +REXCVAR_DEFINE_INT32(native_render_min_pitch, 640, "GPU",
-+                     "Minimum guest surface pitch (in pixels) treated as a "
-+                     "main pass by the native frame renderer. Draws targeting "
-+                     "surfaces narrower than this are suppressed; wider ones "
-+                     "render natively. Dante's Inferno main surface is 1280 "
-+                     "wide; 640 keeps half-resolution post passes suppressed.")
++                     "Minimum main-surface width (in pixels) for a draw to "
++                     "render through the native frame, compared against the "
++                     "real surface width (the EDRAM pitch counts pixels at "
++                     "1x/2x MSAA, but 2-pixel units at 4x). Draws targeting "
++                     "surfaces that don't match the swap width, or narrower "
++                     "than this, are suppressed. Dante's Inferno main surface "
++                     "is 1280 pixels wide at 4x MSAA (EDRAM pitch 640 - the "
++                     "same pitch value as a 1x 640-wide half-resolution post "
++                     "surface, which raw-pitch routing cannot distinguish).")
 +    .range(0, 8192)
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +
@@ -866,36 +881,46 @@ index 0000000..99cfafa
 +  }
 +  const RegisterFile& regs = *command_processor_.register_file_;
 +  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++  // Real surface width in pixels: the EDRAM pitch counts pixels at 1x/2x
++  // MSAA, but 2-pixel units at 4x (2x2 samples packed per pixel). The raw
++  // pitch cannot distinguish the 4x-MSAA 1280-wide main surface (pitch 640)
++  // from a 1x 640-wide half-resolution post surface - both have pitch 640.
++  // Routing by raw pitch made half-resolution post passes render into the
++  // native frame and recreate its targets mid-frame on Dante's Inferno,
++  // presenting a black screen; compare the computed width instead.
++  const uint32_t surface_width =
++      uint32_t(rb_surface_info.surface_pitch)
++      << uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
 +  auto log_route = [&](DrawRoute route) {
 +    switch (route) {
 +      case DrawRoute::kNative:
 +        if (!logged_first_native_route_) {
 +          logged_first_native_route_ = true;
-+          REXLOG_INFO("NativeFrameRenderer: first NATIVE draw (pitch {}, msaa {}, memexport {}, "
-+                      "rasterization {})",
++          REXLOG_INFO("NativeFrameRenderer: first NATIVE draw (pitch {}, msaa {}, width {}, "
++                      "swap width {}, memexport {}, rasterization {})",
 +                      uint32_t(rb_surface_info.surface_pitch),
-+                      uint32_t(rb_surface_info.msaa_samples), memexport_writes_possible,
-+                      is_rasterization_done);
++                      uint32_t(rb_surface_info.msaa_samples), surface_width, last_swap_width_,
++                      memexport_writes_possible, is_rasterization_done);
 +        }
 +        break;
 +      case DrawRoute::kSkip:
 +        if (!logged_first_skip_route_) {
 +          logged_first_skip_route_ = true;
-+          REXLOG_INFO("NativeFrameRenderer: first SKIPPED draw (pitch {}, msaa {}, memexport {}, "
-+                      "rasterization {})",
++          REXLOG_INFO("NativeFrameRenderer: first SKIPPED draw (pitch {}, msaa {}, width {}, "
++                      "swap width {}, memexport {}, rasterization {})",
 +                      uint32_t(rb_surface_info.surface_pitch),
-+                      uint32_t(rb_surface_info.msaa_samples), memexport_writes_possible,
-+                      is_rasterization_done);
++                      uint32_t(rb_surface_info.msaa_samples), surface_width, last_swap_width_,
++                      memexport_writes_possible, is_rasterization_done);
 +        }
 +        break;
 +      case DrawRoute::kEmulated:
 +        if (!logged_first_emulated_route_) {
 +          logged_first_emulated_route_ = true;
-+          REXLOG_INFO("NativeFrameRenderer: first EMULATED draw (pitch {}, msaa {}, memexport {}, "
-+                      "rasterization {})",
++          REXLOG_INFO("NativeFrameRenderer: first EMULATED draw (pitch {}, msaa {}, width {}, "
++                      "swap width {}, memexport {}, rasterization {})",
 +                      uint32_t(rb_surface_info.surface_pitch),
-+                      uint32_t(rb_surface_info.msaa_samples), memexport_writes_possible,
-+                      is_rasterization_done);
++                      uint32_t(rb_surface_info.msaa_samples), surface_width, last_swap_width_,
++                      memexport_writes_possible, is_rasterization_done);
 +        }
 +        break;
 +    }
@@ -921,11 +946,21 @@ index 0000000..99cfafa
 +    log_route(DrawRoute::kSkip);
 +    return DrawRoute::kSkip;
 +  }
++  // The native frame presents the swap-sized surface only. Anything else
++  // (render-to-texture, half-resolution post chains, shadow maps) is
++  // suppressed - same policy as the Skate 3 port's suppression of the
++  // sub-framebuffer passes. Width, not pitch, is the discriminator: at 4x
++  // MSAA the main surface's EDRAM pitch equals a half-resolution 1x pass's
++  // pitch (640 for a 1280-wide 4x scene and a 640-wide 1x post pass alike).
++  if (!last_swap_width_) {
++    // First frame (BeginFrameDraw hasn't run yet) - query the video mode
++    // directly; BeginFrameDraw keeps last_swap_width_ updated afterwards.
++    system::X_VIDEO_MODE video_mode;
++    kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
++    last_swap_width_ = std::max(uint32_t(1), uint32_t(video_mode.display_width));
++  }
 +  const int32_t min_pitch = REXCVAR_GET(native_render_min_pitch);
-+  if (int32_t(rb_surface_info.surface_pitch) < min_pitch) {
-+    // Render-to-texture / post chain / shadow map surface: suppressed, the
-+    // native frame does not consume its output (same policy as the Skate 3
-+    // port's suppression of the sub-framebuffer passes).
++  if (surface_width != last_swap_width_ || int32_t(surface_width) < min_pitch) {
 +    ++frame_skip_count_;
 +    log_route(DrawRoute::kSkip);
 +    return DrawRoute::kSkip;
@@ -1292,6 +1327,11 @@ index 0000000..99cfafa
 +  kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
 +  uint32_t width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
 +  uint32_t height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
++  // RouteDraw compares guest surface widths against the swap width (pitch
++  // alone cannot tell the 4x-MSAA main surface from a half-resolution 1x
++  // pass) - keep the last seen swap dimensions cached for it.
++  last_swap_width_ = width;
++  last_swap_height_ = height;
 +
 +  // Host attachment sample count must match the pipelines created through the
 +  // render pass key: 1 << guest MSAA samples, with the render target cache's
