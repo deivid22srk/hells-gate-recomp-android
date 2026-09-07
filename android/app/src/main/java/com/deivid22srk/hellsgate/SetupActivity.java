@@ -18,7 +18,6 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -61,22 +60,7 @@ public class SetupActivity extends Activity {
     private ProgressBar progress;
     private Button pickButton;
     private Button playButton;
-    private Switch rendererSwitch;
     private int resumeAction = RESUME_NONE;
-
-    /**
-     * Renderer selection flow (Java -> native):
-     *   1. The switch persists to SharedPreferences AND mirrors a one-word file
-     *      "renderer.txt" ("native" / "xenos") next to game_root.txt.
-     *   2. android_main (native) reads renderer.txt and passes
-     *      --gpu_plugin=native when "native" is selected.
-     *   3. DantesInfernoApp::OnPreSetup honors the explicit --gpu_plugin cvar;
-     *      without it the stock librexgpu-xenos.so loads as before.
-     * The native rexgpu-native plugin (librexgpu-native.so) ships in the APK:
-     * persistent driver pipeline cache + BCn-preserving texture policy for
-     * mobile GPUs (Adreno/Mali). Selected at startup only - a change takes
-     * effect on the next game launch, hence the summary text.
-     */
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -113,25 +97,6 @@ public class SetupActivity extends Activity {
         pickButton.setOnClickListener(v -> onPickClicked());
         root.addView(pickButton);
 
-        // Renderer toggle: native (rexgpu-native) vs stock (rexgpu-xenos).
-        // Visible always; only consumed by the native side when the game is
-        // configured. Persisted immediately on change.
-        applyOneTimeRendererReset();
-        rendererSwitch = new Switch(this);
-        rendererSwitch.setText(R.string.setup_renderer_label);
-        rendererSwitch.setTextSize(14);
-        rendererSwitch.setPadding(0, pad / 2, 0, 0);
-        rendererSwitch.setChecked(readRendererPref());
-        rendererSwitch.setOnCheckedChangeListener((buttonView, isChecked) ->
-                persistRenderer(isChecked));
-        root.addView(rendererSwitch);
-
-        TextView rendererHelp = new TextView(this);
-        rendererHelp.setText(R.string.setup_renderer_summary);
-        rendererHelp.setTextSize(12);
-        rendererHelp.setPadding(0, pad / 4, 0, 0);
-        root.addView(rendererHelp);
-
         playButton = new Button(this);
         playButton.setText(R.string.setup_play);
         playButton.setOnClickListener(v -> launchGame());
@@ -145,8 +110,8 @@ public class SetupActivity extends Activity {
 
         setContentView(root);
 
-        // Configured: show the home state (renderer toggle + Play). Launching
-        // is explicit so the renderer toggle is reachable on every launch.
+        // Configured: show the home state (Play). Launching is explicit so the
+        // status text stays reachable on every launch.
         if (hasValidConfig()) {
             playButton.setVisibility(View.VISIBLE);
             setStatus(R.string.setup_status_ready);
@@ -479,71 +444,6 @@ public class SetupActivity extends Activity {
 
     private SharedPreferences prefs() {
         return getSharedPreferences("settings", MODE_PRIVATE);
-    }
-
-    /** Current renderer selection. Source of truth: prefs; a leftover
-     *  renderer.txt (from a previous install of an older build) seeds it. */
-    private boolean readRendererPref() {
-        if (prefs().contains("native_renderer")) {
-            return prefs().getBoolean("native_renderer", false);
-        }
-        try {
-            File external = getExternalFilesDir(null);
-            if (external != null) {
-                File f = new File(external, "renderer.txt");
-                if (f.isFile()) {
-                    byte[] bytes = new byte[(int) Math.min(f.length(), 64)];
-                    try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
-                        int n = in.read(bytes);
-                        if (n > 0) {
-                            boolean nativeRenderer = new String(bytes, 0, n).trim()
-                                    .equalsIgnoreCase("native");
-                            prefs().edit().putBoolean("native_renderer", nativeRenderer).apply();
-                            return nativeRenderer;
-                        }
-                    }
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return false;
-    }
-
-    /** Persists the renderer choice: prefs (UI source of truth) + renderer.txt
-     *  (consumed by android_main on the next native start). */
-    private void persistRenderer(boolean nativeRenderer) {
-        prefs().edit().putBoolean("native_renderer", nativeRenderer).apply();
-        try {
-            File external = getExternalFilesDir(null);
-            if (external != null) {
-                java.io.PrintWriter w = new java.io.PrintWriter(
-                        new java.io.FileWriter(new File(external, "renderer.txt"), false));
-                w.println(nativeRenderer ? "native" : "xenos");
-                w.close();
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    /** One-time reset of the renderer selection (v0.1.5). The first ARM-native
-     *  renderer suppressed the passes the game's final composite samples from
-     *  (EDRAM resolves / render-to-texture chains), so it presented a black
-     *  screen on Dante's Inferno. Everyone who had the toggle on landed back
-     *  on the stock (working) renderer. v0.1.6 replaced that renderer with a
-     *  hybrid design (native scene + EDRAM resolve bridge + emulated post)
-     *  that composes the real image and falls back to the emulated path by
-     *  itself when the bridge cannot run. */
-    private static final String PREF_RENDERER_RESET_V15 = "renderer_reset_v15";
-
-    private void applyOneTimeRendererReset() {
-        if (prefs().getBoolean(PREF_RENDERER_RESET_V15, false)) {
-            return;
-        }
-        if (prefs().contains("native_renderer")
-                && prefs().getBoolean("native_renderer", false)) {
-            persistRenderer(false);
-        }
-        prefs().edit().putBoolean(PREF_RENDERER_RESET_V15, true).apply();
     }
 
     private boolean hasValidConfig() {

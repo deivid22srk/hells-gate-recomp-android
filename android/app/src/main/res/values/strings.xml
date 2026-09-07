@@ -16,6 +16,12 @@
     <string name="setup_status_reset">Configuração limpa. Selecione a pasta do jogo novamente.</string>
     <string name="setup_play">Iniciar jogo</string>
     <string name="setup_status_ready">Jogo configurado e pronto.</string>
-    <string name="setup_renderer_label">Renderizador nativo (experimental)</string>
-    <string name="setup_renderer_summary">Desligado: renderizador original (rexgpu-xenos), totalmente emulado. Ligado: renderizador nativo ARM (rexgpu-native) — a cena é desenhada diretamente em Vulkan e a ponte de resolve alimenta o pós-processamento do jogo com os pixels reais (o passe final continua emulado). Se a ponte não funcionar neste aparelho, o renderizador volta sozinho para o modo emulado (sem tela preta). A mudança vale na próxima vez que o jogo iniciar.</string>
+
+    <!-- Virtual gamepad (overlay + in-game settings dialog) -->
+    <string name="pad_settings_title">Controles em tela</string>
+    <string name="pad_size">Tamanho: %1$d%%</string>
+    <string name="pad_opacity">Opacidade: %1$d%%</string>
+    <string name="pad_haptics">Vibração ao tocar</string>
+    <string name="pad_reset">Padrão</string>
+    <string name="pad_hide">Ocultar</string>
 </resources>

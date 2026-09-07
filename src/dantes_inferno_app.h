@@ -24,8 +24,7 @@ REXCVAR_DEFINE_DOUBLE(time_scalar, 1.0, "Gameplay",
                       "Guest time scaling factor (1.0 = normal, 50.0 = fast-forward)");
 
 // Defined in the SDK (src/ui/rex_app.cpp, compiled into this same library):
-// explicit GPU plugin selection from the command line (the Android renderer
-// toggle passes --gpu_plugin=native when the native renderer is enabled).
+// explicit GPU plugin selection from the command line (default: xenos).
 REXCVAR_DECLARE(std::string, gpu_plugin);
 
 // Toggle for the FPS overlay. Default ON on this port: mobile hardware makes
@@ -152,12 +151,10 @@ class DantesInfernoApp : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override {
     // --- GPU plugin ---
     // Default: the stock Xenos GPU emulation plugin (librexgpu-xenos.so).
-    // An explicit --gpu_plugin=<name> argument (the Android renderer toggle
-    // writes --gpu_plugin=native from renderer.txt) selects an alternative
-    // plugin shipped in the APK (e.g. librexgpu-native.so, the ARM renderer).
-    // The cvar is parsed before OnPreSetup runs, so an explicit value wins
-    // over the default below. Without a GPU plugin, all Vd* graphics calls
-    // are no-ops and the game can't render anything.
+    // An explicit --gpu_plugin=<name> argument selects an alternative GPU
+    // plugin shipped in the APK. The cvar is parsed before OnPreSetup runs, so
+    // an explicit value wins over the default below. Without a GPU plugin,
+    // all Vd* graphics calls are no-ops and the game can't render anything.
     const std::string gpu_plugin_cvar = REXCVAR_GET(gpu_plugin);
     config.gpu_plugin =
         gpu_plugin_cvar.empty() ? std::string("xenos") : gpu_plugin_cvar;
@@ -195,51 +192,16 @@ class DantesInfernoApp : public rex::ReXApp {
     // silently break gamepad support.
     REXCVAR_SET(input_backend, std::string("sdl"));
 
-    // Enable keyboard/mouse as a virtual controller and use the mouse for the
-    // right stick (dodge/camera in Dante's Inferno).
-    rex::cvar::SetFlagByName("mnk_mode", "true");
-    rex::cvar::SetFlagByName("mnk_mouse", "true");
-    rex::cvar::SetFlagByName("mnk_sensitivity", "1.5");
-
-    // Dante's Inferno MnK keybinds (action-oriented layout).
-    // Game Xbox 360 layout:
-    //   A = Jump / Interact / Confirm
-    //   B = Heavy attack / Cancel
-    //   X = Light attack
-    //   Y = Grab / Context action
-    //   LB = Block / Parry / Target lock
-    //   RB = Magic / Projectile
-    //   LT = Block / Modifier
-    //   RT = Magic / Projectile
-    //   Right stick = Dodge / Evade (flick direction)
-    //   Back = Pause / Menu
-    //   Start = Pause / Journal
-    rex::cvar::SetFlagByName("keybind_a", "Space");
-    rex::cvar::SetFlagByName("keybind_b", "F");
-    rex::cvar::SetFlagByName("keybind_x", "MouseLeft");
-    rex::cvar::SetFlagByName("keybind_y", "E");
-    rex::cvar::SetFlagByName("keybind_left_shoulder", "Q");
-    rex::cvar::SetFlagByName("keybind_right_shoulder", "MouseRight");
-    rex::cvar::SetFlagByName("keybind_left_trigger", "Shift");
-    rex::cvar::SetFlagByName("keybind_right_trigger", "Ctrl");
-    rex::cvar::SetFlagByName("keybind_lstick_up", "W");
-    rex::cvar::SetFlagByName("keybind_lstick_down", "S");
-    rex::cvar::SetFlagByName("keybind_lstick_left", "A");
-    rex::cvar::SetFlagByName("keybind_lstick_right", "D");
-    rex::cvar::SetFlagByName("keybind_lstick_press", "X");
-    // Right stick is driven by the mouse (mnk_mouse=true); arrow keys are a
-    // fallback for dodge flicks.
-    rex::cvar::SetFlagByName("keybind_rstick_up", "Up");
-    rex::cvar::SetFlagByName("keybind_rstick_down", "Down");
-    rex::cvar::SetFlagByName("keybind_rstick_left", "Left");
-    rex::cvar::SetFlagByName("keybind_rstick_right", "Right");
-    rex::cvar::SetFlagByName("keybind_rstick_press", "R");
-    rex::cvar::SetFlagByName("keybind_dpad_up", "Shift+Up");
-    rex::cvar::SetFlagByName("keybind_dpad_down", "Shift+Down");
-    rex::cvar::SetFlagByName("keybind_dpad_left", "Shift+Left");
-    rex::cvar::SetFlagByName("keybind_dpad_right", "Shift+Right");
-    rex::cvar::SetFlagByName("keybind_back", "Tab");
-    rex::cvar::SetFlagByName("keybind_start", "Escape");
+    // --- Touch input (Android virtual gamepad) ---
+    // Input on a phone comes from the app's on-screen virtual gamepad
+    // (android_gamepad.cpp): a Java overlay feeds an SDL3 virtual joystick,
+    // which flows through this very SDL gamepad driver as a standard
+    // controller. The MnK driver stays loaded (upstream default) but must NOT
+    // be active here: with mnk_mode=true every SDL mouse event (including
+    // touch-to-mouse emulation on Android) would drive the right stick and
+    // fight the on-screen controls. Physical Bluetooth gamepads still work -
+    // they enumerate through the same SDL driver and keep user 0 priority.
+    rex::cvar::SetFlagByName("mnk_mode", "false");
   }
 
   void OnPreLaunchModule() override {

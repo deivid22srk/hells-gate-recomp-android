@@ -5,6 +5,9 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 
+import com.deivid22srk.hellsgate.gamepad.PadSettings;
+import com.deivid22srk.hellsgate.gamepad.VirtualPadView;
+
 import org.libsdl.app.SDLActivity;
 
 /**
@@ -17,6 +20,9 @@ import org.libsdl.app.SDLActivity;
  */
 public class MainActivity extends SDLActivity {
 
+    /** The on-screen virtual gamepad overlay (null when disabled). */
+    private VirtualPadView mGamepad;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         if (!GameFiles.hasValidGameRoot(this)) {
@@ -28,6 +34,23 @@ public class MainActivity extends SDLActivity {
             return;
         }
         super.onCreate(savedInstanceState);
+        // The virtual gamepad rides ON TOP of the SDL surface as a sibling
+        // view and consumes the full gesture stream (the game reads a
+        // gamepad only). The native side attaches the SDL virtual gamepad
+        // after the runtime's input driver is up (see android_gamepad.cpp),
+        // so no Java-side attach races are possible.
+        if (PadSettings.get(this).enabled()) {
+            mGamepad = VirtualPadView.install(this);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        if (mGamepad != null) {
+            // Never let a button stick down while the game is backgrounded.
+            mGamepad.onHostPause();
+        }
+        super.onPause();
     }
 
     @Override
