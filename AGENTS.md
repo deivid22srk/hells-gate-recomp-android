@@ -88,6 +88,17 @@ fixed (see `docs/vp6_fmv_corruption_fix.md`).
 
 ## SDK patches
 
+Patches are applied in order by `scripts/setup-android.sh`:
+1. `rexglue-sdk-v0.10.0.patch` - upstream project patch (VMX builder fixes etc.)
+2. `rexglue-sdk-v0.10.0-android.patch` - Android platform support
+3. `rexglue-sdk-v0.10.0-android-perf.patch` - fault-path / frame-upload / lock fixes
+4. `rexglue-sdk-v0.10.0-native-renderer.patch` - rexgpu-native ARM renderer plugin
+5. `rexglue-sdk-v0.10.0-android-aaa-perf.patch` - AAA perf layer: CPU BCn->ASTC/
+   ETC2/EAC transcoder (bc_transcoder.h/.cpp, validated by
+   `scripts/bc_transcode_test/`), descriptor set reuse in UpdateBindings,
+   index buffer dirty check, big.LITTLE thread affinity helpers, coalesced
+   conservative memexport invalidation. See `docs/android_aaa_perf_2026-09.md`.
+
 The SDK under `thirdparty/rexglue-sdk/` has local patches to
 `src/codegen/builders/vector.cpp` that fix VMX instruction builder bugs.
 Full technical documentation: `docs/vp6_fmv_corruption_fix.md`.
